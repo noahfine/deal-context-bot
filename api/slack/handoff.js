@@ -1,6 +1,8 @@
 import crypto from "crypto";
 import axios from "axios";
 
+const SLACK_TIMEOUT_MS = 8000;
+
 function verifySlackRequest(req, rawBody) {
   const timestamp = req.headers["x-slack-request-timestamp"];
   const signature = req.headers["x-slack-signature"];
@@ -36,7 +38,7 @@ async function readRawBody(req) {
 
 async function postEphemeral(response_url, text) {
   if (!response_url) return;
-  await axios.post(response_url, { response_type: "ephemeral", text });
+  await axios.post(response_url, { response_type: "ephemeral", text }, { timeout: SLACK_TIMEOUT_MS });
 }
 
 export default async function handler(req, res) {
@@ -72,7 +74,7 @@ export default async function handler(req, res) {
     has_response_url: Boolean(response_url)
   });
 
-  // Ack immediately
+  // Ack immediately (Slack requires <= 3 seconds)
   res.status(200).json({
     response_type: "ephemeral",
     text: "Working on it. I’ll post the deal handoff summary here in a moment."
@@ -85,18 +87,20 @@ export default async function handler(req, res) {
     try {
       infoResp = await axios.get("https://slack.com/api/conversations.info", {
         headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
-        params: { channel: channel_id }
+        params: { channel: channel_id },
+        timeout: SLACK_TIMEOUT_MS
       });
       console.log("conversations.info raw response:", infoResp.data);
     } catch (err) {
       console.error(
         "conversations.info request failed:",
-        err?.response?.data || err?.message || err
+        err?.response?.data || err?.code || err?.message || err
       );
       await postEphemeral(
         response_url,
         `Slack API error calling conversations.info: ${
           (err?.response?.data && JSON.stringify(err.response.data)) ||
+          err?.code ||
           err?.message ||
           "unknown_error"
         }`
@@ -126,15 +130,22 @@ export default async function handler(req, res) {
           channel: channel_id,
           text: `• Detected channel #${channelName}. HubSpot + OpenAI wiring next.`
         },
-        { headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` } }
+        {
+          headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+          timeout: SLACK_TIMEOUT_MS
+        }
       );
       console.log("chat.postMessage raw response:", postResp.data);
     } catch (err) {
-      console.error("chat.postMessage request failed:", err?.response?.data || err?.message || err);
+      console.error(
+        "chat.postMessage request failed:",
+        err?.response?.data || err?.code || err?.message || err
+      );
       await postEphemeral(
         response_url,
         `Slack API error calling chat.postMessage: ${
           (err?.response?.data && JSON.stringify(err.response.data)) ||
+          err?.code ||
           err?.message ||
           "unknown_error"
         }`
@@ -160,4 +171,3 @@ export default async function handler(req, res) {
     );
   }
 }
-
