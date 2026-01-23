@@ -2,61 +2,93 @@ import axios from "axios";
 import { kv } from "@vercel/kv";
 
 export default async function handler(req, res) {
-  const { code, error, error_description } = req.query;
+  try {
+    const { code, error, error_description } = req.query;
 
-  if (error) {
-    return res
-      .status(400)
-      .send(
-        `HubSpot OAuth error: ${error}${
-          error_description ? ` — ${error_description}` : ""
-        }`
-      );
-  }
+    console.log("HubSpot callback hit", {
+      hasCode: Boolean(code),
+      error: error || null
+    });
 
-  if (!code) {
-    return res.status(400).send("Missing ?code= in callback");
-  }
-
-  const clientId = process.env.HUBSPOT_CLIENT_ID;
-  const clientSecret = process.env.HUBSPOT_CLIENT_SECRET;
-  const redirectUri = process.env.HUBSPOT_REDIRECT_URI;
-
-  if (!clientId || !clientSecret || !redirectUri) {
-    return res
-      .status(500)
-      .send(
-        "Missing HUBSPOT_CLIENT_ID, HUBSPOT_CLIENT_SECRET, or HUBSPOT_REDIRECT_URI"
-      );
-  }
-
-  const form = new URLSearchParams();
-  form.set("grant_type", "authorization_code");
-  form.set("client_id", clientId);
-  form.set("client_secret", clientSecret);
-  form.set("redirect_uri", redirectUri);
-  form.set("code", code);
-
-  const tokenResp = await axios.post(
-    "https://api.hubapi.com/oauth/v1/token",
-    form,
-    {
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      timeout: 10000
+    if (error) {
+      return res
+        .status(400)
+        .send(`HubSpot OAuth error: ${error}${error_description ? ` — ${error_description}` : ""}`);
     }
-  );
 
-  const { access_token, refresh_token, expires_in } = tokenResp.data;
+    if (!code) {
+      return res.status(400).send("Missing ?code= in callback");
+    }
 
-  const expiresAtMs = Date.now() + Number(expires_in || 0) * 1000;
+    const clientId = process.env.HUBSPOT_CLIENT_ID;
+    const clientSecret = process.env.HUBSPOT_CLIENT_SECRET;
+    const redirectUri = process.env.HUBSPOT_REDIRECT_URI;
 
-  await kv.set("hubspot:access_token", access_token);
-  await kv.set("hubspot:refresh_token", refresh_token);
-  await kv.set("hubspot:expires_at_ms", expiresAtMs);
+    console.log("Env present?", {
+      clientId: Boolean(clientId),
+      clientSecret: Boolean(clientSecret),
+      redirectUri: Boolean(redirectUri)
+    });
 
-  return res
-    .status(200)
-    .send(
-      "✅ HubSpot connected. You can close this tab and run /summary in Slack."
-    );
+    if (!clientId || !clientSecret || !redirectUri) {
+      return res
+        .status(500)
+        .send("Missing HUBSPOT_CLIENT_ID, HUBSPOT_CLIENT_SECRET, or HUBSPOT_REDIRECT_URI");
+    }
+
+    const form = new URLSearchParams();
+    form.set("grant_type", "authorization_code");
+    form.set("client_id", clientId);
+    form.set("client_secret", clientSecret);
+    form.set("redirect_uri", redirectUri);
+    form.set("code", code);
+
+    console.log("Exchanging code for tokens...");
+
+    let tokenResp;
+    try {
+      tokenResp = await axios.post("https://api.hubapi.com/oauth/v1/token", form, {
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        timeout: 15000
+      });
+    } catch (err) {
+      console.error("Token exchange failed", err?.response?.data || err?.message || err);
+      return res
+        .status(500)
+        .send(
+          `Token exchange failed: ${
+            (err?.response?.data && JSON.stringify(err.response.data)) || err?.message || "unknown_error"
+          }`
+        );
+    }
+
+    const { access_token, refresh_token, expires_in } = tokenResp.data || {};
+    console.log("Token exchange success?", {
+      hasAccess: Boolean(access_token),
+      hasRefresh: Boolean(refresh_token),
+      expires_in: expires_in || null
+    });
+
+    if (!access_token || !refresh_token) {
+      return res.status(500).send("Token exchange response missing access_token or refresh_token");
+    }
+
+    const expiresAtMs = Date.now() + Number(expires_in || 0) * 1000;
+
+    console.log("Writing tokens to KV...");
+    try {
+      await kv.set("hubspot:access_token", access_token);
+      await kv.set("hubspot:refresh_token", refresh_token);
+      await kv.set("hubspot:expires_at_ms", expiresAtMs);
+    } catch (err) {
+      console.error("KV write failed", err?.message || err);
+      return res.status(500).send(`KV write failed: ${err?.message || "unknown_error"}`);
+    }
+
+    console.log("KV write success");
+    return res.status(200).send("✅ HubSpot connected. You can close this tab and run /summary in Slack.");
+  } catch (err) {
+    console.error("Callback crashed", err?.message || err);
+    return res.status(500).send(`Callback crashed: ${err?.message || "unknown_error"}`);
+  }
 }
