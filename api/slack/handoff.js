@@ -81,10 +81,28 @@ export default async function handler(req, res) {
   try {
     console.log("Fetching channel info from Slack...");
 
-    const infoResp = await axios.get("https://slack.com/api/conversations.info", {
-      headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
-      params: { channel: channel_id }
-    });
+    let infoResp;
+    try {
+      infoResp = await axios.get("https://slack.com/api/conversations.info", {
+        headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+        params: { channel: channel_id }
+      });
+      console.log("conversations.info raw response:", infoResp.data);
+    } catch (err) {
+      console.error(
+        "conversations.info request failed:",
+        err?.response?.data || err?.message || err
+      );
+      await postEphemeral(
+        response_url,
+        `Slack API error calling conversations.info: ${
+          (err?.response?.data && JSON.stringify(err.response.data)) ||
+          err?.message ||
+          "unknown_error"
+        }`
+      );
+      return;
+    }
 
     if (!infoResp.data?.ok) {
       console.error("conversations.info returned ok:false", infoResp.data);
