@@ -1,16 +1,18 @@
 import axios from "axios";
-import { Redis } from "@upstash/redis";
+import Redis from "ioredis";
 
-/* ===== MANUAL INPUT REQUIRED HERE ===== */
+/* Uses your existing env var (no value pasted here) */
 const redisUrl = process.env.deal_summarizer_bot_REDIS_URL;
-/* ===================================== */
 
 if (!redisUrl) {
   throw new Error("Missing deal_summarizer_bot_REDIS_URL environment variable");
 }
 
-const redis = new Redis({
-  url: redisUrl
+const redis = new Redis(redisUrl, {
+  // Helps avoid hanging during connection issues
+  connectTimeout: 10000,
+  maxRetriesPerRequest: 2,
+  enableReadyCheck: true
 });
 
 export default async function handler(req, res) {
@@ -24,18 +26,11 @@ export default async function handler(req, res) {
         .status(400)
         .send(`HubSpot OAuth error: ${error}${error_description ? ` — ${error_description}` : ""}`);
     }
-
     if (!code) return res.status(400).send("Missing ?code= in callback");
 
     const clientId = process.env.HUBSPOT_CLIENT_ID;
     const clientSecret = process.env.HUBSPOT_CLIENT_SECRET;
     const redirectUri = process.env.HUBSPOT_REDIRECT_URI;
-
-    console.log("Env present?", {
-      clientId: Boolean(clientId),
-      clientSecret: Boolean(clientSecret),
-      redirectUri: Boolean(redirectUri)
-    });
 
     if (!clientId || !clientSecret || !redirectUri) {
       return res
@@ -52,25 +47,12 @@ export default async function handler(req, res) {
 
     console.log("Exchanging code for tokens...");
 
-    let tokenResp;
-    try {
-      tokenResp = await axios.post("https://api.hubapi.com/oauth/v1/token", form, {
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        timeout: 15000
-      });
-    } catch (err) {
-      console.error("Token exchange failed", err?.response?.data || err?.message || err);
-      return res
-        .status(500)
-        .send(
-          `Token exchange failed: ${
-            (err?.response?.data && JSON.stringify(err.response.data)) || err?.message || "unknown_error"
-          }`
-        );
-    }
+    const tokenResp = await axios.post("https://api.hubapi.com/oauth/v1/token", form, {
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      timeout: 15000
+    });
 
     const { access_token, refresh_token, expires_in } = tokenResp.data || {};
-
     if (!access_token || !refresh_token) {
       return res.status(500).send("Token exchange response missing access_token or refresh_token");
     }
@@ -83,12 +65,9 @@ export default async function handler(req, res) {
     await redis.set("hubspot:expires_at_ms", String(expiresAtMs));
     console.log("Redis write success");
 
-    return res
-      .status(200)
-      .send("✅ HubSpot connected. You can close this tab and run /summary in Slack.");
+    return res.status(200).send("✅ HubSpot connected. You can close this tab and run /summary in Slack.");
   } catch (err) {
-    console.error("Callback crashed", err?.message || err);
+    console.error("Callback crashed", err?.response?.data || err?.message || err);
     return res.status(500).send(`Callback crashed: ${err?.message || "unknown_error"}`);
   }
 }
-
