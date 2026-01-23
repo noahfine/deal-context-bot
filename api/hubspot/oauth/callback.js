@@ -1,24 +1,20 @@
 import axios from "axios";
-import { kv } from "@vercel/kv";
+import { Redis } from "@upstash/redis";
+
+const redis = Redis.fromEnv();
 
 export default async function handler(req, res) {
   try {
     const { code, error, error_description } = req.query;
 
-    console.log("HubSpot callback hit", {
-      hasCode: Boolean(code),
-      error: error || null
-    });
+    console.log("HubSpot callback hit", { hasCode: Boolean(code), error: error || null });
 
     if (error) {
       return res
         .status(400)
         .send(`HubSpot OAuth error: ${error}${error_description ? ` — ${error_description}` : ""}`);
     }
-
-    if (!code) {
-      return res.status(400).send("Missing ?code= in callback");
-    }
+    if (!code) return res.status(400).send("Missing ?code= in callback");
 
     const clientId = process.env.HUBSPOT_CLIENT_ID;
     const clientSecret = process.env.HUBSPOT_CLIENT_SECRET;
@@ -75,17 +71,12 @@ export default async function handler(req, res) {
 
     const expiresAtMs = Date.now() + Number(expires_in || 0) * 1000;
 
-    console.log("Writing tokens to KV...");
-    try {
-      await kv.set("hubspot:access_token", access_token);
-      await kv.set("hubspot:refresh_token", refresh_token);
-      await kv.set("hubspot:expires_at_ms", expiresAtMs);
-    } catch (err) {
-      console.error("KV write failed", err?.message || err);
-      return res.status(500).send(`KV write failed: ${err?.message || "unknown_error"}`);
-    }
+    console.log("Writing tokens to Redis...");
+    await redis.set("hubspot:access_token", access_token);
+    await redis.set("hubspot:refresh_token", refresh_token);
+    await redis.set("hubspot:expires_at_ms", String(expiresAtMs));
+    console.log("Redis write success");
 
-    console.log("KV write success");
     return res.status(200).send("✅ HubSpot connected. You can close this tab and run /summary in Slack.");
   } catch (err) {
     console.error("Callback crashed", err?.message || err);
