@@ -1,7 +1,17 @@
 import axios from "axios";
 import { Redis } from "@upstash/redis";
 
-const redis = Redis.fromEnv();
+/* ===== MANUAL INPUT REQUIRED HERE ===== */
+const redisUrl = process.env.deal_summarizer_bot_REDIS_URL;
+/* ===================================== */
+
+if (!redisUrl) {
+  throw new Error("Missing deal_summarizer_bot_REDIS_URL environment variable");
+}
+
+const redis = new Redis({
+  url: redisUrl
+});
 
 export default async function handler(req, res) {
   try {
@@ -14,6 +24,7 @@ export default async function handler(req, res) {
         .status(400)
         .send(`HubSpot OAuth error: ${error}${error_description ? ` — ${error_description}` : ""}`);
     }
+
     if (!code) return res.status(400).send("Missing ?code= in callback");
 
     const clientId = process.env.HUBSPOT_CLIENT_ID;
@@ -59,11 +70,6 @@ export default async function handler(req, res) {
     }
 
     const { access_token, refresh_token, expires_in } = tokenResp.data || {};
-    console.log("Token exchange success?", {
-      hasAccess: Boolean(access_token),
-      hasRefresh: Boolean(refresh_token),
-      expires_in: expires_in || null
-    });
 
     if (!access_token || !refresh_token) {
       return res.status(500).send("Token exchange response missing access_token or refresh_token");
@@ -77,9 +83,12 @@ export default async function handler(req, res) {
     await redis.set("hubspot:expires_at_ms", String(expiresAtMs));
     console.log("Redis write success");
 
-    return res.status(200).send("✅ HubSpot connected. You can close this tab and run /summary in Slack.");
+    return res
+      .status(200)
+      .send("✅ HubSpot connected. You can close this tab and run /summary in Slack.");
   } catch (err) {
     console.error("Callback crashed", err?.message || err);
     return res.status(500).send(`Callback crashed: ${err?.message || "unknown_error"}`);
   }
 }
+
