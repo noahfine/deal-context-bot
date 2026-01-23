@@ -4,10 +4,8 @@ import axios from "axios";
 function verifySlackRequest(req, rawBody) {
   const timestamp = req.headers["x-slack-request-timestamp"];
   const signature = req.headers["x-slack-signature"];
-
   if (!timestamp || !signature) return false;
 
-  // Prevent replay attacks (5 min window)
   const fiveMinutes = 60 * 5;
   const nowSec = Math.floor(Date.now() / 1000);
   if (Math.abs(nowSec - Number(timestamp)) > fiveMinutes) return false;
@@ -38,23 +36,16 @@ async function readRawBody(req) {
 
 async function postEphemeral(response_url, text) {
   if (!response_url) return;
-  await axios.post(response_url, {
-    response_type: "ephemeral",
-    text
-  });
+  await axios.post(response_url, { response_type: "ephemeral", text });
 }
 
 export default async function handler(req, res) {
-  // Helpful log so you can always find the invocation
   console.log("Incoming request", { method: req.method, path: req.url });
 
-  if (req.method !== "POST") {
-    return res.status(405).send("Method Not Allowed");
-  }
+  if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
   const rawBody = await readRawBody(req);
 
-  // Verify Slack signature
   const signingSecretPresent = Boolean(process.env.SLACK_SIGNING_SECRET);
   const botTokenPresent = Boolean(process.env.SLACK_BOT_TOKEN);
   console.log("Env present?", { signingSecretPresent, botTokenPresent });
@@ -81,7 +72,7 @@ export default async function handler(req, res) {
     has_response_url: Boolean(response_url)
   });
 
-  // ACK immediately (Slack requires <= 3 seconds)
+  // Ack immediately
   res.status(200).json({
     response_type: "ephemeral",
     text: "Working on it. I’ll post the deal handoff summary here in a moment."
@@ -96,7 +87,7 @@ export default async function handler(req, res) {
     });
 
     if (!infoResp.data?.ok) {
-      console.error("conversations.info failed", infoResp.data);
+      console.error("conversations.info returned ok:false", infoResp.data);
       await postEphemeral(
         response_url,
         `Slack error calling conversations.info: ${infoResp.data?.error || "unknown_error"}`
@@ -109,19 +100,32 @@ export default async function handler(req, res) {
 
     console.log("Posting message to Slack channel...");
 
-    const postResp = await axios.post(
-      "https://slack.com/api/chat.postMessage",
-      {
-        channel: channel_id,
-        text: `• Detected channel #${channelName}. HubSpot + OpenAI wiring next.`
-      },
-      {
-        headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` }
-      }
-    );
+    let postResp;
+    try {
+      postResp = await axios.post(
+        "https://slack.com/api/chat.postMessage",
+        {
+          channel: channel_id,
+          text: `• Detected channel #${channelName}. HubSpot + OpenAI wiring next.`
+        },
+        { headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` } }
+      );
+      console.log("chat.postMessage raw response:", postResp.data);
+    } catch (err) {
+      console.error("chat.postMessage request failed:", err?.response?.data || err?.message || err);
+      await postEphemeral(
+        response_url,
+        `Slack API error calling chat.postMessage: ${
+          (err?.response?.data && JSON.stringify(err.response.data)) ||
+          err?.message ||
+          "unknown_error"
+        }`
+      );
+      return;
+    }
 
     if (!postResp.data?.ok) {
-      console.error("chat.postMessage failed", postResp.data);
+      console.error("chat.postMessage returned ok:false", postResp.data);
       await postEphemeral(
         response_url,
         `Slack error calling chat.postMessage: ${postResp.data?.error || "unknown_error"}`
@@ -131,14 +135,10 @@ export default async function handler(req, res) {
 
     console.log("Posted message successfully", { ts: postResp.data.ts });
   } catch (err) {
-    const slackish = err?.response?.data;
-    console.error("Handoff error:", slackish || err?.message || err);
-
+    console.error("Handoff error:", err?.response?.data || err?.message || err);
     await postEphemeral(
       response_url,
-      `Error generating summary: ${
-        (slackish && JSON.stringify(slackish)) || err?.message || "unknown_error"
-      }`
+      `Error generating summary: ${err?.message || "unknown_error"}`
     );
   }
 }
