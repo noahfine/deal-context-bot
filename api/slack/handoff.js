@@ -1,7 +1,7 @@
 import crypto from "crypto";
 import axios from "axios";
 
-const SLACK_TIMEOUT_MS = 8000;
+const SLACK_TIMEOUT_MS = 2500; // keep it tight so we stay under Slack’s 3s window
 
 function verifySlackRequest(req, rawBody) {
   const timestamp = req.headers["x-slack-request-timestamp"];
@@ -36,12 +36,8 @@ async function readRawBody(req) {
   });
 }
 
-async function postEphemeral(response_url, text) {
-  if (!response_url) return;
-  await axios.post(response_url, { response_type: "ephemeral", text }, { timeout: SLACK_TIMEOUT_MS });
-}
-
 export default async function handler(req, res) {
+  const start = Date.now();
   console.log("Incoming request", { method: req.method, path: req.url });
 
   if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
@@ -64,57 +60,31 @@ export default async function handler(req, res) {
 
   const payload = Object.fromEntries(new URLSearchParams(rawBody));
   const channel_id = payload.channel_id;
-  const response_url = payload.response_url;
 
   console.log("Slash command received", {
     command: payload.command,
     channel_id,
     user_id: payload.user_id,
-    team_id: payload.team_id,
-    has_response_url: Boolean(response_url)
-  });
-
-  // Ack immediately (Slack requires <= 3 seconds)
-  res.status(200).json({
-    response_type: "ephemeral",
-    text: "Working on it. I’ll post the deal handoff summary here in a moment."
+    team_id: payload.team_id
   });
 
   try {
     console.log("Fetching channel info from Slack...");
 
-    let infoResp;
-    try {
-      infoResp = await axios.get("https://slack.com/api/conversations.info", {
-        headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
-        params: { channel: channel_id },
-        timeout: SLACK_TIMEOUT_MS
-      });
-      console.log("conversations.info raw response:", infoResp.data);
-    } catch (err) {
-      console.error(
-        "conversations.info request failed:",
-        err?.response?.data || err?.code || err?.message || err
-      );
-      await postEphemeral(
-        response_url,
-        `Slack API error calling conversations.info: ${
-          (err?.response?.data && JSON.stringify(err.response.data)) ||
-          err?.code ||
-          err?.message ||
-          "unknown_error"
-        }`
-      );
-      return;
-    }
+    const infoResp = await axios.get("https://slack.com/api/conversations.info", {
+      headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+      params: { channel: channel_id },
+      timeout: SLACK_TIMEOUT_MS
+    });
+
+    console.log("conversations.info response:", infoResp.data);
 
     if (!infoResp.data?.ok) {
-      console.error("conversations.info returned ok:false", infoResp.data);
-      await postEphemeral(
-        response_url,
-        `Slack error calling conversations.info: ${infoResp.data?.error || "unknown_error"}`
-      );
-      return;
+      console.error("conversations.info ok:false", infoResp.data);
+      return res.status(200).json({
+        response_type: "ephemeral",
+        text: `Slack error calling conversations.info: ${infoResp.data?.error || "unknown_error"}`
+      });
     }
 
     const channelName = infoResp.data.channel?.name || "name_not_found";
@@ -122,52 +92,44 @@ export default async function handler(req, res) {
 
     console.log("Posting message to Slack channel...");
 
-    let postResp;
-    try {
-      postResp = await axios.post(
-        "https://slack.com/api/chat.postMessage",
-        {
-          channel: channel_id,
-          text: `• Detected channel #${channelName}. HubSpot + OpenAI wiring next.`
-        },
-        {
-          headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
-          timeout: SLACK_TIMEOUT_MS
-        }
-      );
-      console.log("chat.postMessage raw response:", postResp.data);
-    } catch (err) {
-      console.error(
-        "chat.postMessage request failed:",
-        err?.response?.data || err?.code || err?.message || err
-      );
-      await postEphemeral(
-        response_url,
-        `Slack API error calling chat.postMessage: ${
-          (err?.response?.data && JSON.stringify(err.response.data)) ||
-          err?.code ||
-          err?.message ||
-          "unknown_error"
-        }`
-      );
-      return;
-    }
+    const postResp = await axios.post(
+      "https://slack.com/api/chat.postMessage",
+      {
+        channel: channel_id,
+        text: `• Detected channel #${channelName}. HubSpot + OpenAI wiring next.`
+      },
+      {
+        headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+        timeout: SLACK_TIMEOUT_MS
+      }
+    );
+
+    console.log("chat.postMessage response:", postResp.data);
 
     if (!postResp.data?.ok) {
-      console.error("chat.postMessage returned ok:false", postResp.data);
-      await postEphemeral(
-        response_url,
-        `Slack error calling chat.postMessage: ${postResp.data?.error || "unknown_error"}`
-      );
-      return;
+      console.error("chat.postMessage ok:false", postResp.data);
+      return res.status(200).json({
+        response_type: "ephemeral",
+        text: `Slack error calling chat.postMessage: ${postResp.data?.error || "unknown_error"}`
+      });
     }
 
-    console.log("Posted message successfully", { ts: postResp.data.ts });
+    const elapsed = Date.now() - start;
+    console.log("Done", { elapsed_ms: elapsed });
+
+    // Respond to the slash command (ephemeral)
+    return res.status(200).json({
+      response_type: "ephemeral",
+      text: `Posted summary to #${channelName}. (${elapsed}ms)`
+    });
   } catch (err) {
-    console.error("Handoff error:", err?.response?.data || err?.message || err);
-    await postEphemeral(
-      response_url,
-      `Error generating summary: ${err?.message || "unknown_error"}`
-    );
+    const data = err?.response?.data;
+    console.error("Handler error:", data || err?.code || err?.message || err);
+
+    return res.status(200).json({
+      response_type: "ephemeral",
+      text: `Error: ${(data && JSON.stringify(data)) || err?.code || err?.message || "unknown_error"}`
+    });
   }
 }
+
