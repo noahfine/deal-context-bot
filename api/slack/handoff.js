@@ -1,7 +1,14 @@
 import crypto from "crypto";
 import axios from "axios";
+import Redis from "ioredis";
 
-const SLACK_TIMEOUT_MS = 2500; // keep it tight so we stay under Slack’s 3s window
+const SLACK_TIMEOUT_MS = 2500;
+const HUBSPOT_TIMEOUT_MS = 10000;
+const OPENAI_TIMEOUT_MS = 20000;
+
+const redisUrl = process.env.deal_summarizer_bot_REDIS_URL;
+if (!redisUrl) throw new Error("Missing deal_summarizer_bot_REDIS_URL environment variable");
+const redis = new Redis(redisUrl, { connectTimeout: 10000, maxRetriesPerRequest: 2, enableReadyCheck: true });
 
 function verifySlackRequest(req, rawBody) {
   const timestamp = req.headers["x-slack-request-timestamp"];
@@ -36,99 +43,339 @@ async function readRawBody(req) {
   });
 }
 
+function channelNameToDealQuery(channelName) {
+  // reverse the slug: dashes to spaces
+  // "conception-case-hillsman-et-al" -> "conception case hillsman et al"
+  return (channelName || "").replace(/-/g, " ").trim();
+}
+
+async function getSlackChannelName(channel_id) {
+  const resp = await axios.get("https://slack.com/api/conversations.info", {
+    headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+    params: { channel: channel_id },
+    timeout: SLACK_TIMEOUT_MS
+  });
+  if (!resp.data?.ok) throw new Error(`Slack conversations.info error: ${resp.data?.error || "unknown_error"}`);
+  return resp.data.channel?.name || "name_not_found";
+}
+
+async function slackPost(channel_id, text) {
+  const resp = await axios.post(
+    "https://slack.com/api/chat.postMessage",
+    { channel: channel_id, text },
+    { headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` }, timeout: SLACK_TIMEOUT_MS }
+  );
+  if (!resp.data?.ok) throw new Error(`Slack chat.postMessage error: ${resp.data?.error || "unknown_error"}`);
+  return resp.data;
+}
+
+async function hubspotTokenExchange(form) {
+  const resp = await axios.post("https://api.hubapi.com/oauth/v1/token", form, {
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    timeout: HUBSPOT_TIMEOUT_MS
+  });
+  return resp.data;
+}
+
+async function getHubSpotAccessToken() {
+  const access = await redis.get("hubspot:access_token");
+  const refresh = await redis.get("hubspot:refresh_token");
+  const expiresAtMsStr = await redis.get("hubspot:expires_at_ms");
+  const expiresAtMs = expiresAtMsStr ? Number(expiresAtMsStr) : 0;
+
+  if (!refresh) throw new Error("HubSpot not connected: missing refresh token in Redis");
+
+  const now = Date.now();
+  const bufferMs = 60 * 1000; // refresh 60s early
+  if (access && expiresAtMs && now < expiresAtMs - bufferMs) return access;
+
+  // Refresh
+  const form = new URLSearchParams();
+  form.set("grant_type", "refresh_token");
+  form.set("client_id", process.env.HUBSPOT_CLIENT_ID);
+  form.set("client_secret", process.env.HUBSPOT_CLIENT_SECRET);
+  form.set("refresh_token", refresh);
+
+  const data = await hubspotTokenExchange(form);
+  const newAccess = data.access_token;
+  const expiresIn = Number(data.expires_in || 0);
+  const newExpiresAt = Date.now() + expiresIn * 1000;
+
+  await redis.set("hubspot:access_token", newAccess);
+  await redis.set("hubspot:expires_at_ms", String(newExpiresAt));
+
+  return newAccess;
+}
+
+function hubspotClient(accessToken) {
+  return axios.create({
+    baseURL: "https://api.hubapi.com",
+    headers: { Authorization: `Bearer ${accessToken}` },
+    timeout: HUBSPOT_TIMEOUT_MS
+  });
+}
+
+async function findBestDeal(hs, dealQuery) {
+  // Search deals by name. We'll bias toward Closed Won + most recent closedate.
+  // Endpoint: POST /crm/v3/objects/deals/search
+  const body = {
+    filterGroups: [
+      {
+        filters: [
+          { propertyName: "dealname", operator: "CONTAINS_TOKEN", value: dealQuery }
+        ]
+      }
+    ],
+    properties: ["dealname", "createdate", "closedate", "dealstage", "pipeline", "hubspot_owner_id"],
+    limit: 10
+  };
+
+  const resp = await hs.post("/crm/v3/objects/deals/search", body);
+  const results = resp.data?.results || [];
+  if (!results.length) return null;
+
+  // prefer closed won if we can detect it by stage label isn't available here.
+  // We'll just pick the one with the most recent closedate if present.
+  results.sort((a, b) => {
+    const ac = a.properties?.closedate ? Number(new Date(a.properties.closedate)) : 0;
+    const bc = b.properties?.closedate ? Number(new Date(b.properties.closedate)) : 0;
+    return bc - ac;
+  });
+
+  return results[0];
+}
+
+async function getDealAssociations(hs, dealId) {
+  // Grab associated contacts + company ids
+  const [contacts, companies] = await Promise.allSettled([
+    hs.get(`/crm/v4/objects/deals/${dealId}/associations/contacts`),
+    hs.get(`/crm/v4/objects/deals/${dealId}/associations/companies`)
+  ]);
+
+  const contactIds =
+    contacts.status === "fulfilled"
+      ? (contacts.value.data?.results || []).map((r) => r.toObjectId).filter(Boolean)
+      : [];
+
+  const companyIds =
+    companies.status === "fulfilled"
+      ? (companies.value.data?.results || []).map((r) => r.toObjectId).filter(Boolean)
+      : [];
+
+  return { contactIds, companyIds };
+}
+
+async function batchRead(hs, objectType, ids, properties) {
+  if (!ids.length) return [];
+  const resp = await hs.post(`/crm/v3/objects/${objectType}/batch/read`, {
+    inputs: ids.slice(0, 50).map((id) => ({ id })),
+    properties
+  });
+  return resp.data?.results || [];
+}
+
+async function resolveOwnerName(hs, ownerId) {
+  if (!ownerId) return null;
+  try {
+    const resp = await hs.get(`/crm/v3/owners/${ownerId}`);
+    const o = resp.data;
+    const name = [o?.firstName, o?.lastName].filter(Boolean).join(" ").trim();
+    return name || null;
+  } catch {
+    return null;
+  }
+}
+
+function daysBetweenISO(a, b) {
+  if (!a || !b) return null;
+  const da = new Date(a).getTime();
+  const db = new Date(b).getTime();
+  if (!da || !db) return null;
+  const diff = Math.round((db - da) / (1000 * 60 * 60 * 24));
+  return diff;
+}
+
+async function callOpenAI(promptText) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
+
+  // Using Responses API
+  const resp = await axios.post(
+    "https://api.openai.com/v1/responses",
+    {
+      model: "gpt-4.1-mini",
+      input: promptText
+    },
+    {
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      timeout: OPENAI_TIMEOUT_MS
+    }
+  );
+
+  // Extract text
+  const output = resp.data?.output || [];
+  const text = output
+    .flatMap((o) => o.content || [])
+    .filter((c) => c.type === "output_text")
+    .map((c) => c.text)
+    .join("\n")
+    .trim();
+
+  return text;
+}
+
+function buildPromptFromHubSpotData({ dealName, hubspotDealUrl, ownerLine, created, closed, cycleDays, contactsLine, notesSummary }) {
+  /* ===== MANUAL INPUT REQUIRED HERE =====
+     Paste your production prompt template (system+user rules) into this string,
+     but DO NOT include “Find the HubSpot deal named ...” as an instruction.
+     Instead, we provide the deal context directly below.
+
+     You can paste your text exactly and just change the first sentence to:
+     "Using the HubSpot data below for deal {dealName}, produce exactly 3–5 bullets..."
+  ====================================== */
+
+  const instructions = `
+You are generating a post-sales handoff summary for a project Slack channel. Be concise, factual, and write like a salesperson giving a short verbal handoff to Deployments and Customer Success.
+
+Using the HubSpot data below for deal "${dealName}", produce exactly 3–5 bullets that cover the KEY deployment/CSM points. Use Slack mrkdwn or plain text bullets only.
+
+Rules:
+- Return exactly 3 to 5 bullet lines only. Each bullet must be 1–2 sentences. No raw JSON or field dumps.
+- Do not invent facts. If something is not present or clear, write: Not observed in HubSpot history.
+
+HubSpot data:
+- Deal: ${dealName}
+- Deal link: ${hubspotDealUrl}
+- Sales owner: ${ownerLine}
+- Created/Closed: ${created || "Not observed in HubSpot history"} / ${closed || "Not observed in HubSpot history"}${
+    cycleDays != null ? ` — ${cycleDays} days` : ""
+  }
+- Contacts: ${contactsLine}
+- Notes / recent activity summary: ${notesSummary}
+`.trim();
+
+  return instructions;
+}
+
 export default async function handler(req, res) {
   const start = Date.now();
-  console.log("Incoming request", { method: req.method, path: req.url });
 
   if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
   const rawBody = await readRawBody(req);
 
-  const signingSecretPresent = Boolean(process.env.SLACK_SIGNING_SECRET);
-  const botTokenPresent = Boolean(process.env.SLACK_BOT_TOKEN);
-  console.log("Env present?", { signingSecretPresent, botTokenPresent });
-
-  if (!signingSecretPresent || !botTokenPresent) {
-    console.error("Missing required env vars");
-    return res.status(500).send("Server misconfigured: missing env vars");
+  if (!process.env.SLACK_SIGNING_SECRET || !process.env.SLACK_BOT_TOKEN) {
+    return res.status(500).send("Missing Slack env vars");
   }
 
   if (!verifySlackRequest(req, rawBody)) {
-    console.error("Invalid Slack signature");
     return res.status(401).send("Invalid signature");
   }
 
   const payload = Object.fromEntries(new URLSearchParams(rawBody));
   const channel_id = payload.channel_id;
 
-  console.log("Slash command received", {
-    command: payload.command,
-    channel_id,
-    user_id: payload.user_id,
-    team_id: payload.team_id
-  });
-
   try {
-    console.log("Fetching channel info from Slack...");
+    const channelName = await getSlackChannelName(channel_id);
+    const dealQuery = channelNameToDealQuery(channelName);
 
-    const infoResp = await axios.get("https://slack.com/api/conversations.info", {
-      headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
-      params: { channel: channel_id },
-      timeout: SLACK_TIMEOUT_MS
+    // HubSpot
+    const accessToken = await getHubSpotAccessToken();
+    const hs = hubspotClient(accessToken);
+
+    const deal = await findBestDeal(hs, dealQuery);
+    if (!deal) {
+      return res.status(200).json({
+        response_type: "ephemeral",
+        text: `No HubSpot deal found matching "${dealQuery}".`
+      });
+    }
+
+    const dealId = deal.id;
+    const dealName = deal.properties?.dealname || dealQuery;
+    const created = deal.properties?.createdate || null;
+    const closed = deal.properties?.closedate || null;
+    const cycleDays = daysBetweenISO(created, closed);
+
+    const ownerId = deal.properties?.hubspot_owner_id || null;
+    const ownerName = await resolveOwnerName(hs, ownerId);
+    const ownerLine = ownerName ? `${ownerName} (Sales)` : (ownerId ? `${ownerId} (name not found in HubSpot)` : "Not observed in HubSpot history");
+
+    const { contactIds, companyIds } = await getDealAssociations(hs, dealId);
+
+    const contacts = await batchRead(hs, "contacts", contactIds, ["firstname", "lastname", "jobtitle", "email"]);
+    const companies = await batchRead(hs, "companies", companyIds, ["name", "domain"]);
+
+    const contactsLine = contacts.length
+      ? contacts
+          .slice(0, 6)
+          .map((c) => {
+            const p = c.properties || {};
+            const nm = [p.firstname, p.lastname].filter(Boolean).join(" ").trim() || "Name not observed";
+            const role = p.jobtitle ? `, ${p.jobtitle}` : "";
+            const email = p.email ? ` (${p.email})` : "";
+            return `${nm}${role}${email}`;
+          })
+          .join("; ")
+      : "Not observed in HubSpot history";
+
+    const companyLine = companies.length
+      ? companies
+          .slice(0, 2)
+          .map((c) => c.properties?.name)
+          .filter(Boolean)
+          .join("; ")
+      : "Not observed in HubSpot history";
+
+    // Notes/engagements: best effort (scope/API variability)
+    let notesSummary = "Not observed in HubSpot history";
+    try {
+      // Some portals support associations to notes via CRM v4.
+      const assoc = await hs.get(`/crm/v4/objects/deals/${dealId}/associations/notes`);
+      const noteIds = (assoc.data?.results || []).map((r) => r.toObjectId).filter(Boolean).slice(0, 10);
+
+      if (noteIds.length) {
+        const notes = await batchRead(hs, "notes", noteIds, ["hs_note_body", "hs_createdate"]);
+        const snippets = notes
+          .sort((a, b) => Number(new Date(b.properties?.hs_createdate || 0)) - Number(new Date(a.properties?.hs_createdate || 0)))
+          .slice(0, 10)
+          .map((n) => (n.properties?.hs_note_body || "").replace(/\s+/g, " ").trim())
+          .filter(Boolean)
+          .slice(0, 6);
+
+        if (snippets.length) notesSummary = snippets.join(" | ").slice(0, 1200);
+      }
+    } catch (e) {
+      // leave default
+    }
+
+    const hubspotDealUrl = `https://app.hubspot.com/contacts/${payload.team_id}/deal/${dealId}`; // may not be perfect; still useful
+    const prompt = buildPromptFromHubSpotData({
+      dealName,
+      hubspotDealUrl,
+      ownerLine,
+      created,
+      closed,
+      cycleDays,
+      contactsLine,
+      notesSummary: `${notesSummary}${companyLine !== "Not observed in HubSpot history" ? ` (Company: ${companyLine})` : ""}`
     });
 
-    console.log("conversations.info response:", infoResp.data);
+    const summaryText = await callOpenAI(prompt);
 
-    if (!infoResp.data?.ok) {
-      console.error("conversations.info ok:false", infoResp.data);
-      return res.status(200).json({
-        response_type: "ephemeral",
-        text: `Slack error calling conversations.info: ${infoResp.data?.error || "unknown_error"}`
-      });
-    }
-
-    const channelName = infoResp.data.channel?.name || "name_not_found";
-    console.log("Channel name resolved:", channelName);
-
-    console.log("Posting message to Slack channel...");
-
-    const postResp = await axios.post(
-      "https://slack.com/api/chat.postMessage",
-      {
-        channel: channel_id,
-        text: `• Detected channel #${channelName}. HubSpot + OpenAI wiring next.`
-      },
-      {
-        headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
-        timeout: SLACK_TIMEOUT_MS
-      }
-    );
-
-    console.log("chat.postMessage response:", postResp.data);
-
-    if (!postResp.data?.ok) {
-      console.error("chat.postMessage ok:false", postResp.data);
-      return res.status(200).json({
-        response_type: "ephemeral",
-        text: `Slack error calling chat.postMessage: ${postResp.data?.error || "unknown_error"}`
-      });
-    }
+    // Post in channel
+    await slackPost(channel_id, summaryText);
 
     const elapsed = Date.now() - start;
-    console.log("Done", { elapsed_ms: elapsed });
-
-    // Respond to the slash command (ephemeral)
     return res.status(200).json({
       response_type: "ephemeral",
-      text: `Posted summary to #${channelName}. (${elapsed}ms)`
+      text: `Posted deal summary to #${channelName}. (${elapsed}ms)`
     });
   } catch (err) {
-    const data = err?.response?.data;
-    console.error("Handler error:", data || err?.code || err?.message || err);
-
+    const msg = err?.response?.data ? JSON.stringify(err.response.data) : (err?.message || "unknown_error");
     return res.status(200).json({
       response_type: "ephemeral",
-      text: `Error: ${(data && JSON.stringify(data)) || err?.code || err?.message || "unknown_error"}`
+      text: `Error: ${msg}`
     });
   }
 }
