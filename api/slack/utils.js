@@ -5,8 +5,30 @@ const SLACK_TIMEOUT_MS = 2500;
 const HUBSPOT_TIMEOUT_MS = 10000;
 
 const redisUrl = process.env.deal_summarizer_bot_REDIS_URL;
-if (!redisUrl) throw new Error("Missing deal_summarizer_bot_REDIS_URL environment variable");
-export const redis = new Redis(redisUrl, { connectTimeout: 10000, maxRetriesPerRequest: 2, enableReadyCheck: true });
+
+// Lazy initialization to avoid module load errors at build time
+let redisInstance = null;
+function getRedis() {
+  if (!redisUrl) {
+    throw new Error("Missing deal_summarizer_bot_REDIS_URL environment variable");
+  }
+  if (!redisInstance) {
+    redisInstance = new Redis(redisUrl, { connectTimeout: 10000, maxRetriesPerRequest: 2, enableReadyCheck: true });
+  }
+  return redisInstance;
+}
+
+// Export redis as a Proxy to forward all method calls (maintains full compatibility)
+export const redis = new Proxy({}, {
+  get(target, prop) {
+    const redis = getRedis();
+    const value = redis[prop];
+    if (typeof value === 'function') {
+      return value.bind(redis);
+    }
+    return value;
+  }
+});
 
 // ===== Slack API Helpers =====
 
