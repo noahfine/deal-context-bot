@@ -399,6 +399,11 @@ async function handleThreadReply(event) {
 }
 
 export default async function handler(req, res) {
+  // Allow GET for health checks and Slack verification during installation
+  if (req.method === "GET") {
+    return res.status(200).json({ status: "ok", endpoint: "slack-events" });
+  }
+
   if (req.method !== "POST") {
     return res.status(405).send("Method Not Allowed");
   }
