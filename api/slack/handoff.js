@@ -1,15 +1,10 @@
 import crypto from "crypto";
 import axios from "axios";
-import Redis from "ioredis";
-import { getSlackChannelName, slackPost, channelNameToDealQuery } from "./utils.js";
+import { getSlackChannelName, slackPost, channelNameToDealQuery, getRedis } from "./utils.js";
 
 const SLACK_TIMEOUT_MS = 2500;
 const HUBSPOT_TIMEOUT_MS = 10000;
 const OPENAI_TIMEOUT_MS = 20000;
-
-const redisUrl = process.env.deal_summarizer_bot_REDIS_URL;
-if (!redisUrl) throw new Error("Missing deal_summarizer_bot_REDIS_URL environment variable");
-const redis = new Redis(redisUrl, { connectTimeout: 10000, maxRetriesPerRequest: 2, enableReadyCheck: true });
 
 function verifySlackRequest(req, rawBody) {
   const timestamp = req.headers["x-slack-request-timestamp"];
@@ -62,6 +57,7 @@ async function hubspotTokenExchange(form) {
 }
 
 async function getHubSpotAccessToken() {
+  const redis = getRedis();
   const access = await redis.get("hubspot:access_token");
   const refresh = await redis.get("hubspot:refresh_token");
   const expiresAtMsStr = await redis.get("hubspot:expires_at_ms");
@@ -352,7 +348,10 @@ export default async function handler(req, res) {
     await slackPost(channel_id, summaryText);
     await postToResponseUrl(response_url, `Posted deal summary to #${channelName}.`, true);
   } catch (err) {
-    const msg = err?.response?.data ? JSON.stringify(err.response.data) : (err?.message || "unknown_error");
+    let msg = err?.response?.data ? JSON.stringify(err.response.data) : (err?.message || "unknown_error");
+    if (err?.code === "ETIMEDOUT" || msg.includes("ETIMEDOUT")) {
+      msg = "Redis connection timed out. Ensure your Redis host allows connections from Vercel (e.g. allowlist or use Upstash).";
+    }
     try {
       if (response_url) {
         await postToResponseUrl(response_url, `Summary failed: ${msg}`, true);

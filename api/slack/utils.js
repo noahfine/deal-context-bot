@@ -13,7 +13,18 @@ export function getRedis() {
     throw new Error("Missing deal_summarizer_bot_REDIS_URL environment variable");
   }
   if (!redisInstance) {
-    redisInstance = new Redis(redisUrl, { connectTimeout: 10000, maxRetriesPerRequest: 2, enableReadyCheck: true });
+    redisInstance = new Redis(redisUrl, {
+      connectTimeout: 20000,
+      maxRetriesPerRequest: 2,
+      enableReadyCheck: true,
+      retryStrategy(times) {
+        if (times > 2) return null;
+        return Math.min(times * 1000, 3000);
+      },
+    });
+    redisInstance.on("error", (err) => {
+      console.error("[utils Redis] connection error:", err.message);
+    });
   }
   return redisInstance;
 }
@@ -35,52 +46,64 @@ export const redis = new Proxy({}, {
 const SLACK_REFRESH_BUFFER_MS = 60 * 60 * 1000; // refresh 1 hour before expiry
 
 export async function getSlackBotToken() {
-  const redis = getRedis();
-  const access = await redis.get("slack:access_token");
-  const refresh = await redis.get("slack:refresh_token");
-  const expiresAtMsStr = await redis.get("slack:expires_at_ms");
-  const expiresAtMs = expiresAtMsStr ? Number(expiresAtMsStr) : 0;
+  // If env token is set, try Redis first for OAuth tokens; on any Redis failure, use env (restores original /summary behavior when Redis is unreachable)
+  const envToken = process.env.SLACK_BOT_TOKEN || null;
 
-  const now = Date.now();
-  if (access && expiresAtMs && now < expiresAtMs - SLACK_REFRESH_BUFFER_MS) {
-    return access;
-  }
+  try {
+    const redis = getRedis();
+    const access = await redis.get("slack:access_token");
+    const refresh = await redis.get("slack:refresh_token");
+    const expiresAtMsStr = await redis.get("slack:expires_at_ms");
+    const expiresAtMs = expiresAtMsStr ? Number(expiresAtMsStr) : 0;
 
-  if (refresh) {
-    const clientId = process.env.SLACK_CLIENT_ID;
-    const clientSecret = process.env.SLACK_CLIENT_SECRET;
-    if (clientId && clientSecret) {
-      try {
-        const resp = await axios.post(
-          "https://slack.com/api/oauth.v2.access",
-          new URLSearchParams({
-            client_id: clientId,
-            client_secret: clientSecret,
-            grant_type: "refresh_token",
-            refresh_token: refresh,
-          }),
-          {
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
-            timeout: SLACK_TIMEOUT_MS,
+    const now = Date.now();
+    if (access && expiresAtMs && now < expiresAtMs - SLACK_REFRESH_BUFFER_MS) {
+      return access;
+    }
+
+    if (refresh) {
+      const clientId = process.env.SLACK_CLIENT_ID;
+      const clientSecret = process.env.SLACK_CLIENT_SECRET;
+      if (clientId && clientSecret) {
+        try {
+          const resp = await axios.post(
+            "https://slack.com/api/oauth.v2.access",
+            new URLSearchParams({
+              client_id: clientId,
+              client_secret: clientSecret,
+              grant_type: "refresh_token",
+              refresh_token: refresh,
+            }),
+            {
+              headers: { "Content-Type": "application/x-www-form-urlencoded" },
+              timeout: SLACK_TIMEOUT_MS,
+            }
+          );
+          if (resp.data?.ok) {
+            const newAccess = resp.data.access_token;
+            const newRefresh = resp.data.refresh_token;
+            const expiresIn = Number(resp.data.expires_in ?? 43200);
+            const newExpiresAt = Date.now() + expiresIn * 1000;
+            await redis.set("slack:access_token", newAccess);
+            await redis.set("slack:expires_at_ms", String(newExpiresAt));
+            if (newRefresh) await redis.set("slack:refresh_token", newRefresh);
+            return newAccess;
           }
-        );
-        if (resp.data?.ok) {
-          const newAccess = resp.data.access_token;
-          const newRefresh = resp.data.refresh_token;
-          const expiresIn = Number(resp.data.expires_in ?? 43200);
-          const newExpiresAt = Date.now() + expiresIn * 1000;
-          await redis.set("slack:access_token", newAccess);
-          await redis.set("slack:expires_at_ms", String(newExpiresAt));
-          if (newRefresh) await redis.set("slack:refresh_token", newRefresh);
-          return newAccess;
+        } catch (err) {
+          console.error("Slack token refresh error:", err.message);
         }
-      } catch (err) {
-        console.error("Slack token refresh error:", err.message);
       }
     }
-  }
 
-  return process.env.SLACK_BOT_TOKEN || null;
+    return access || envToken;
+  } catch (err) {
+    // Redis unreachable (e.g. ETIMEDOUT from Vercel) — use env token so /summary and Slack API still work
+    if (envToken) {
+      console.warn("Redis unavailable for Slack token, using SLACK_BOT_TOKEN:", err.message);
+      return envToken;
+    }
+    throw err;
+  }
 }
 
 // ===== Slack API Helpers =====
