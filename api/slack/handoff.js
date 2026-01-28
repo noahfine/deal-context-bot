@@ -44,6 +44,15 @@ async function readRawBody(req) {
   });
 }
 
+async function postToResponseUrl(responseUrl, text, replaceOriginal = false) {
+  if (!responseUrl) return;
+  await axios.post(
+    responseUrl,
+    { text, replace_original: replaceOriginal },
+    { headers: { "Content-Type": "application/json" }, timeout: SLACK_TIMEOUT_MS }
+  );
+}
+
 async function hubspotTokenExchange(form) {
   const resp = await axios.post("https://api.hubapi.com/oauth/v1/token", form, {
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -248,6 +257,7 @@ export default async function handler(req, res) {
   const payload = Object.fromEntries(new URLSearchParams(rawBody));
   const channel_id = payload.channel_id;
   const team_id = payload.team_id;
+  const response_url = payload.response_url;
 
   // Respond within 3 seconds or Slack shows "operation_timeout"
   res.status(200).json({
@@ -255,99 +265,103 @@ export default async function handler(req, res) {
     text: "Generating deal summary... (this may take a moment)"
   });
 
-  // Do the work asynchronously
-  (async () => {
-    try {
-      const channelName = await getSlackChannelName(channel_id);
-      const dealQuery = channelNameToDealQuery(channelName);
+  // Await work so the serverless function stays alive; then post result via response_url
+  try {
+    const channelName = await getSlackChannelName(channel_id);
+    const dealQuery = channelNameToDealQuery(channelName);
 
-      const accessToken = await getHubSpotAccessToken();
-      const hs = hubspotClient(accessToken);
+    const accessToken = await getHubSpotAccessToken();
+    const hs = hubspotClient(accessToken);
 
-      const deal = await findBestDeal(hs, dealQuery);
-      if (!deal) {
-        await slackPost(channel_id, `No HubSpot deal found matching "${dealQuery}".`);
-        return;
-      }
-
-      const dealId = deal.id;
-      const dealName = deal.properties?.dealname || dealQuery;
-      const created = deal.properties?.createdate || null;
-      const closed = deal.properties?.closedate || null;
-      const cycleDays = daysBetweenISO(created, closed);
-
-      const ownerId = deal.properties?.hubspot_owner_id || null;
-      const ownerName = await resolveOwnerName(hs, ownerId);
-      const ownerLine = ownerName ? `${ownerName} (Sales)` : (ownerId ? `${ownerId} (name not found in HubSpot)` : "Not observed in HubSpot history");
-
-      const { contactIds, companyIds } = await getDealAssociations(hs, dealId);
-
-      const contacts = await batchRead(hs, "contacts", contactIds, ["firstname", "lastname", "jobtitle", "email"]);
-      const companies = await batchRead(hs, "companies", companyIds, ["name", "domain"]);
-
-      const contactsLine = contacts.length
-        ? contacts
-            .slice(0, 6)
-            .map((c) => {
-              const p = c.properties || {};
-              const nm = [p.firstname, p.lastname].filter(Boolean).join(" ").trim() || "Name not observed";
-              const role = p.jobtitle ? `, ${p.jobtitle}` : "";
-              const email = p.email ? ` (${p.email})` : "";
-              return `${nm}${role}${email}`;
-            })
-            .join("; ")
-        : "Not observed in HubSpot history";
-
-      const companyLine = companies.length
-        ? companies
-            .slice(0, 2)
-            .map((c) => c.properties?.name)
-            .filter(Boolean)
-            .join("; ")
-        : "Not observed in HubSpot history";
-
-      let notesSummary = "Not observed in HubSpot history";
-      try {
-        const assoc = await hs.get(`/crm/v4/objects/deals/${dealId}/associations/notes`);
-        const noteIds = (assoc.data?.results || []).map((r) => r.toObjectId).filter(Boolean).slice(0, 10);
-
-        if (noteIds.length) {
-          const notes = await batchRead(hs, "notes", noteIds, ["hs_note_body", "hs_createdate"]);
-          const snippets = notes
-            .sort((a, b) => Number(new Date(b.properties?.hs_createdate || 0)) - Number(new Date(a.properties?.hs_createdate || 0)))
-            .slice(0, 10)
-            .map((n) => (n.properties?.hs_note_body || "").replace(/\s+/g, " ").trim())
-            .filter(Boolean)
-            .slice(0, 6);
-
-          if (snippets.length) notesSummary = snippets.join(" | ").slice(0, 1200);
-        }
-      } catch (e) {
-        // leave default
-      }
-
-      const hubspotDealUrl = `https://app.hubspot.com/contacts/${team_id}/deal/${dealId}`;
-      const prompt = buildPromptFromHubSpotData({
-        dealName,
-        hubspotDealUrl,
-        ownerLine,
-        created,
-        closed,
-        cycleDays,
-        contactsLine,
-        notesSummary: `${notesSummary}${companyLine !== "Not observed in HubSpot history" ? ` (Company: ${companyLine})` : ""}`
-      });
-
-      const summaryText = await callOpenAI(prompt);
-      await slackPost(channel_id, summaryText);
-    } catch (err) {
-      const msg = err?.response?.data ? JSON.stringify(err.response.data) : (err?.message || "unknown_error");
-      try {
-        await slackPost(channel_id, `Summary failed: ${msg}`);
-      } catch (e) {
-        console.error("Slack post error after summary failure:", e);
-      }
+    const deal = await findBestDeal(hs, dealQuery);
+    if (!deal) {
+      await postToResponseUrl(response_url, `No HubSpot deal found matching "${dealQuery}".`);
+      return;
     }
-  })();
+
+    const dealId = deal.id;
+    const dealName = deal.properties?.dealname || dealQuery;
+    const created = deal.properties?.createdate || null;
+    const closed = deal.properties?.closedate || null;
+    const cycleDays = daysBetweenISO(created, closed);
+
+    const ownerId = deal.properties?.hubspot_owner_id || null;
+    const ownerName = await resolveOwnerName(hs, ownerId);
+    const ownerLine = ownerName ? `${ownerName} (Sales)` : (ownerId ? `${ownerId} (name not found in HubSpot)` : "Not observed in HubSpot history");
+
+    const { contactIds, companyIds } = await getDealAssociations(hs, dealId);
+
+    const contacts = await batchRead(hs, "contacts", contactIds, ["firstname", "lastname", "jobtitle", "email"]);
+    const companies = await batchRead(hs, "companies", companyIds, ["name", "domain"]);
+
+    const contactsLine = contacts.length
+      ? contacts
+          .slice(0, 6)
+          .map((c) => {
+            const p = c.properties || {};
+            const nm = [p.firstname, p.lastname].filter(Boolean).join(" ").trim() || "Name not observed";
+            const role = p.jobtitle ? `, ${p.jobtitle}` : "";
+            const email = p.email ? ` (${p.email})` : "";
+            return `${nm}${role}${email}`;
+          })
+          .join("; ")
+      : "Not observed in HubSpot history";
+
+    const companyLine = companies.length
+      ? companies
+          .slice(0, 2)
+          .map((c) => c.properties?.name)
+          .filter(Boolean)
+          .join("; ")
+      : "Not observed in HubSpot history";
+
+    let notesSummary = "Not observed in HubSpot history";
+    try {
+      const assoc = await hs.get(`/crm/v4/objects/deals/${dealId}/associations/notes`);
+      const noteIds = (assoc.data?.results || []).map((r) => r.toObjectId).filter(Boolean).slice(0, 10);
+
+      if (noteIds.length) {
+        const notes = await batchRead(hs, "notes", noteIds, ["hs_note_body", "hs_createdate"]);
+        const snippets = notes
+          .sort((a, b) => Number(new Date(b.properties?.hs_createdate || 0)) - Number(new Date(a.properties?.hs_createdate || 0)))
+          .slice(0, 10)
+          .map((n) => (n.properties?.hs_note_body || "").replace(/\s+/g, " ").trim())
+          .filter(Boolean)
+          .slice(0, 6);
+
+        if (snippets.length) notesSummary = snippets.join(" | ").slice(0, 1200);
+      }
+    } catch (e) {
+      // leave default
+    }
+
+    const hubspotDealUrl = `https://app.hubspot.com/contacts/${team_id}/deal/${dealId}`;
+    const prompt = buildPromptFromHubSpotData({
+      dealName,
+      hubspotDealUrl,
+      ownerLine,
+      created,
+      closed,
+      cycleDays,
+      contactsLine,
+      notesSummary: `${notesSummary}${companyLine !== "Not observed in HubSpot history" ? ` (Company: ${companyLine})` : ""}`
+    });
+
+    const summaryText = await callOpenAI(prompt);
+    // Post summary in channel and update ephemeral via response_url
+    await slackPost(channel_id, summaryText);
+    await postToResponseUrl(response_url, `Posted deal summary to #${channelName}.`, true);
+  } catch (err) {
+    const msg = err?.response?.data ? JSON.stringify(err.response.data) : (err?.message || "unknown_error");
+    try {
+      if (response_url) {
+        await postToResponseUrl(response_url, `Summary failed: ${msg}`, true);
+      } else {
+        await slackPost(channel_id, `Summary failed: ${msg}`);
+      }
+    } catch (e) {
+      console.error("Post error after summary failure:", e);
+    }
+  }
 }
 
