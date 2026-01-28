@@ -14,12 +14,12 @@ export function getRedis() {
   }
   if (!redisInstance) {
     redisInstance = new Redis(redisUrl, {
-      connectTimeout: 20000,
-      maxRetriesPerRequest: 2,
+      connectTimeout: 5000,
+      maxRetriesPerRequest: 1,
       enableReadyCheck: true,
       retryStrategy(times) {
-        if (times > 2) return null;
-        return Math.min(times * 1000, 3000);
+        if (times > 1) return null;
+        return 1000;
       },
     });
     redisInstance.on("error", (err) => {

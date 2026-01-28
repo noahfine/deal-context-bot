@@ -1,5 +1,6 @@
 import crypto from "crypto";
 import axios from "axios";
+import { waitUntil } from "@vercel/functions";
 import { getSlackChannelName, slackPost, channelNameToDealQuery, getRedis } from "./utils.js";
 
 const SLACK_TIMEOUT_MS = 2500;
@@ -41,11 +42,15 @@ async function readRawBody(req) {
 
 async function postToResponseUrl(responseUrl, text, replaceOriginal = false) {
   if (!responseUrl) return;
-  await axios.post(
-    responseUrl,
-    { text, replace_original: replaceOriginal },
-    { headers: { "Content-Type": "application/json" }, timeout: SLACK_TIMEOUT_MS }
-  );
+  try {
+    await axios.post(
+      responseUrl,
+      { text, replace_original: replaceOriginal },
+      { headers: { "Content-Type": "application/json" }, timeout: 15000 }
+    );
+  } catch (e) {
+    console.error("postToResponseUrl failed:", e.message, e.response?.status);
+  }
 }
 
 async function hubspotTokenExchange(form) {
@@ -261,106 +266,110 @@ export default async function handler(req, res) {
     text: "Generating deal summary... (this may take a moment)"
   });
 
-  // Await work so the serverless function stays alive; then post result via response_url
-  try {
-    const channelName = await getSlackChannelName(channel_id);
-    const dealQuery = channelNameToDealQuery(channelName);
+  // Keep function alive until work completes and we post to response_url (Vercel would otherwise stop after res.json)
+  waitUntil(
+    (async () => {
+      try {
+        const channelName = await getSlackChannelName(channel_id);
+        const dealQuery = channelNameToDealQuery(channelName);
 
-    const accessToken = await getHubSpotAccessToken();
-    const hs = hubspotClient(accessToken);
+        const accessToken = await getHubSpotAccessToken();
+        const hs = hubspotClient(accessToken);
 
-    const deal = await findBestDeal(hs, dealQuery);
-    if (!deal) {
-      await postToResponseUrl(response_url, `No HubSpot deal found matching "${dealQuery}".`);
-      return;
-    }
+        const deal = await findBestDeal(hs, dealQuery);
+        if (!deal) {
+          await postToResponseUrl(response_url, `No HubSpot deal found matching "${dealQuery}".`, true);
+          return;
+        }
 
-    const dealId = deal.id;
-    const dealName = deal.properties?.dealname || dealQuery;
-    const created = deal.properties?.createdate || null;
-    const closed = deal.properties?.closedate || null;
-    const cycleDays = daysBetweenISO(created, closed);
+        const dealId = deal.id;
+        const dealName = deal.properties?.dealname || dealQuery;
+        const created = deal.properties?.createdate || null;
+        const closed = deal.properties?.closedate || null;
+        const cycleDays = daysBetweenISO(created, closed);
 
-    const ownerId = deal.properties?.hubspot_owner_id || null;
-    const ownerName = await resolveOwnerName(hs, ownerId);
-    const ownerLine = ownerName ? `${ownerName} (Sales)` : (ownerId ? `${ownerId} (name not found in HubSpot)` : "Not observed in HubSpot history");
+        const ownerId = deal.properties?.hubspot_owner_id || null;
+        const ownerName = await resolveOwnerName(hs, ownerId);
+        const ownerLine = ownerName ? `${ownerName} (Sales)` : (ownerId ? `${ownerId} (name not found in HubSpot)` : "Not observed in HubSpot history");
 
-    const { contactIds, companyIds } = await getDealAssociations(hs, dealId);
+        const { contactIds, companyIds } = await getDealAssociations(hs, dealId);
 
-    const contacts = await batchRead(hs, "contacts", contactIds, ["firstname", "lastname", "jobtitle", "email"]);
-    const companies = await batchRead(hs, "companies", companyIds, ["name", "domain"]);
+        const contacts = await batchRead(hs, "contacts", contactIds, ["firstname", "lastname", "jobtitle", "email"]);
+        const companies = await batchRead(hs, "companies", companyIds, ["name", "domain"]);
 
-    const contactsLine = contacts.length
-      ? contacts
-          .slice(0, 6)
-          .map((c) => {
-            const p = c.properties || {};
-            const nm = [p.firstname, p.lastname].filter(Boolean).join(" ").trim() || "Name not observed";
-            const role = p.jobtitle ? `, ${p.jobtitle}` : "";
-            const email = p.email ? ` (${p.email})` : "";
-            return `${nm}${role}${email}`;
-          })
-          .join("; ")
-      : "Not observed in HubSpot history";
+        const contactsLine = contacts.length
+          ? contacts
+              .slice(0, 6)
+              .map((c) => {
+                const p = c.properties || {};
+                const nm = [p.firstname, p.lastname].filter(Boolean).join(" ").trim() || "Name not observed";
+                const role = p.jobtitle ? `, ${p.jobtitle}` : "";
+                const email = p.email ? ` (${p.email})` : "";
+                return `${nm}${role}${email}`;
+              })
+              .join("; ")
+          : "Not observed in HubSpot history";
 
-    const companyLine = companies.length
-      ? companies
-          .slice(0, 2)
-          .map((c) => c.properties?.name)
-          .filter(Boolean)
-          .join("; ")
-      : "Not observed in HubSpot history";
+        const companyLine = companies.length
+          ? companies
+              .slice(0, 2)
+              .map((c) => c.properties?.name)
+              .filter(Boolean)
+              .join("; ")
+          : "Not observed in HubSpot history";
 
-    let notesSummary = "Not observed in HubSpot history";
-    try {
-      const assoc = await hs.get(`/crm/v4/objects/deals/${dealId}/associations/notes`);
-      const noteIds = (assoc.data?.results || []).map((r) => r.toObjectId).filter(Boolean).slice(0, 10);
+        let notesSummary = "Not observed in HubSpot history";
+        try {
+          const assoc = await hs.get(`/crm/v4/objects/deals/${dealId}/associations/notes`);
+          const noteIds = (assoc.data?.results || []).map((r) => r.toObjectId).filter(Boolean).slice(0, 10);
 
-      if (noteIds.length) {
-        const notes = await batchRead(hs, "notes", noteIds, ["hs_note_body", "hs_createdate"]);
-        const snippets = notes
-          .sort((a, b) => Number(new Date(b.properties?.hs_createdate || 0)) - Number(new Date(a.properties?.hs_createdate || 0)))
-          .slice(0, 10)
-          .map((n) => (n.properties?.hs_note_body || "").replace(/\s+/g, " ").trim())
-          .filter(Boolean)
-          .slice(0, 6);
+          if (noteIds.length) {
+            const notes = await batchRead(hs, "notes", noteIds, ["hs_note_body", "hs_createdate"]);
+            const snippets = notes
+              .sort((a, b) => Number(new Date(b.properties?.hs_createdate || 0)) - Number(new Date(a.properties?.hs_createdate || 0)))
+              .slice(0, 10)
+              .map((n) => (n.properties?.hs_note_body || "").replace(/\s+/g, " ").trim())
+              .filter(Boolean)
+              .slice(0, 6);
 
-        if (snippets.length) notesSummary = snippets.join(" | ").slice(0, 1200);
+            if (snippets.length) notesSummary = snippets.join(" | ").slice(0, 1200);
+          }
+        } catch (e) {
+          // leave default
+        }
+
+        const hubspotDealUrl = `https://app.hubspot.com/contacts/${team_id}/deal/${dealId}`;
+        const prompt = buildPromptFromHubSpotData({
+          dealName,
+          hubspotDealUrl,
+          ownerLine,
+          created,
+          closed,
+          cycleDays,
+          contactsLine,
+          notesSummary: `${notesSummary}${companyLine !== "Not observed in HubSpot history" ? ` (Company: ${companyLine})` : ""}`
+        });
+
+        const summaryText = await callOpenAI(prompt);
+        await slackPost(channel_id, summaryText);
+        await postToResponseUrl(response_url, `Posted deal summary to #${channelName}.`, true);
+      } catch (err) {
+        console.error("/summary error:", err?.message || err, err?.code);
+        let msg = err?.response?.data ? JSON.stringify(err.response.data) : (err?.message || "unknown_error");
+        if (err?.code === "ETIMEDOUT" || msg.includes("ETIMEDOUT")) {
+          msg = "Redis connection timed out. Check Vercel logs and Redis connectivity.";
+        }
+        if (response_url) {
+          await postToResponseUrl(response_url, `Summary failed: ${msg}`, true);
+        } else {
+          try {
+            await slackPost(channel_id, `Summary failed: ${msg}`);
+          } catch (e) {
+            console.error("slackPost error:", e.message);
+          }
+        }
       }
-    } catch (e) {
-      // leave default
-    }
-
-    const hubspotDealUrl = `https://app.hubspot.com/contacts/${team_id}/deal/${dealId}`;
-    const prompt = buildPromptFromHubSpotData({
-      dealName,
-      hubspotDealUrl,
-      ownerLine,
-      created,
-      closed,
-      cycleDays,
-      contactsLine,
-      notesSummary: `${notesSummary}${companyLine !== "Not observed in HubSpot history" ? ` (Company: ${companyLine})` : ""}`
-    });
-
-    const summaryText = await callOpenAI(prompt);
-    // Post summary in channel and update ephemeral via response_url
-    await slackPost(channel_id, summaryText);
-    await postToResponseUrl(response_url, `Posted deal summary to #${channelName}.`, true);
-  } catch (err) {
-    let msg = err?.response?.data ? JSON.stringify(err.response.data) : (err?.message || "unknown_error");
-    if (err?.code === "ETIMEDOUT" || msg.includes("ETIMEDOUT")) {
-      msg = "Redis connection timed out. Ensure your Redis host allows connections from Vercel (e.g. allowlist or use Upstash).";
-    }
-    try {
-      if (response_url) {
-        await postToResponseUrl(response_url, `Summary failed: ${msg}`, true);
-      } else {
-        await slackPost(channel_id, `Summary failed: ${msg}`);
-      }
-    } catch (e) {
-      console.error("Post error after summary failure:", e);
-    }
-  }
+    })()
+  );
 }
 
