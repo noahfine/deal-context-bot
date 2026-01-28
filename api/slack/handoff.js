@@ -1,6 +1,7 @@
 import crypto from "crypto";
 import axios from "axios";
 import Redis from "ioredis";
+import { getSlackChannelName, slackPost, channelNameToDealQuery } from "./utils.js";
 
 const SLACK_TIMEOUT_MS = 2500;
 const HUBSPOT_TIMEOUT_MS = 10000;
@@ -41,32 +42,6 @@ async function readRawBody(req) {
     req.on("end", () => resolve(data));
     req.on("error", reject);
   });
-}
-
-function channelNameToDealQuery(channelName) {
-  // reverse the slug: dashes to spaces
-  // "conception-case-hillsman-et-al" -> "conception case hillsman et al"
-  return (channelName || "").replace(/-/g, " ").trim();
-}
-
-async function getSlackChannelName(channel_id) {
-  const resp = await axios.get("https://slack.com/api/conversations.info", {
-    headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
-    params: { channel: channel_id },
-    timeout: SLACK_TIMEOUT_MS
-  });
-  if (!resp.data?.ok) throw new Error(`Slack conversations.info error: ${resp.data?.error || "unknown_error"}`);
-  return resp.data.channel?.name || "name_not_found";
-}
-
-async function slackPost(channel_id, text) {
-  const resp = await axios.post(
-    "https://slack.com/api/chat.postMessage",
-    { channel: channel_id, text },
-    { headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` }, timeout: SLACK_TIMEOUT_MS }
-  );
-  if (!resp.data?.ok) throw new Error(`Slack chat.postMessage error: ${resp.data?.error || "unknown_error"}`);
-  return resp.data;
 }
 
 async function hubspotTokenExchange(form) {

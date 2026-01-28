@@ -8,7 +8,7 @@ const redisUrl = process.env.deal_summarizer_bot_REDIS_URL;
 
 // Lazy initialization to avoid module load errors at build time
 let redisInstance = null;
-function getRedis() {
+export function getRedis() {
   if (!redisUrl) {
     throw new Error("Missing deal_summarizer_bot_REDIS_URL environment variable");
   }
@@ -30,11 +30,66 @@ export const redis = new Proxy({}, {
   }
 });
 
+// ===== Slack Bot Token (OAuth / token rotation) =====
+
+const SLACK_REFRESH_BUFFER_MS = 60 * 60 * 1000; // refresh 1 hour before expiry
+
+export async function getSlackBotToken() {
+  const redis = getRedis();
+  const access = await redis.get("slack:access_token");
+  const refresh = await redis.get("slack:refresh_token");
+  const expiresAtMsStr = await redis.get("slack:expires_at_ms");
+  const expiresAtMs = expiresAtMsStr ? Number(expiresAtMsStr) : 0;
+
+  const now = Date.now();
+  if (access && expiresAtMs && now < expiresAtMs - SLACK_REFRESH_BUFFER_MS) {
+    return access;
+  }
+
+  if (refresh) {
+    const clientId = process.env.SLACK_CLIENT_ID;
+    const clientSecret = process.env.SLACK_CLIENT_SECRET;
+    if (clientId && clientSecret) {
+      try {
+        const resp = await axios.post(
+          "https://slack.com/api/oauth.v2.access",
+          new URLSearchParams({
+            client_id: clientId,
+            client_secret: clientSecret,
+            grant_type: "refresh_token",
+            refresh_token: refresh,
+          }),
+          {
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            timeout: SLACK_TIMEOUT_MS,
+          }
+        );
+        if (resp.data?.ok) {
+          const newAccess = resp.data.access_token;
+          const newRefresh = resp.data.refresh_token;
+          const expiresIn = Number(resp.data.expires_in ?? 43200);
+          const newExpiresAt = Date.now() + expiresIn * 1000;
+          await redis.set("slack:access_token", newAccess);
+          await redis.set("slack:expires_at_ms", String(newExpiresAt));
+          if (newRefresh) await redis.set("slack:refresh_token", newRefresh);
+          return newAccess;
+        }
+      } catch (err) {
+        console.error("Slack token refresh error:", err.message);
+      }
+    }
+  }
+
+  return process.env.SLACK_BOT_TOKEN || null;
+}
+
 // ===== Slack API Helpers =====
 
 export async function getSlackChannelName(channel_id) {
+  const token = await getSlackBotToken();
+  if (!token) throw new Error("No Slack bot token (install app or set SLACK_BOT_TOKEN)");
   const resp = await axios.get("https://slack.com/api/conversations.info", {
-    headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+    headers: { Authorization: `Bearer ${token}` },
     params: { channel: channel_id },
     timeout: SLACK_TIMEOUT_MS
   });
@@ -43,8 +98,10 @@ export async function getSlackChannelName(channel_id) {
 }
 
 export async function getSlackChannelInfo(channel_id) {
+  const token = await getSlackBotToken();
+  if (!token) throw new Error("No Slack bot token (install app or set SLACK_BOT_TOKEN)");
   const resp = await axios.get("https://slack.com/api/conversations.info", {
-    headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+    headers: { Authorization: `Bearer ${token}` },
     params: { channel: channel_id },
     timeout: SLACK_TIMEOUT_MS
   });
@@ -57,8 +114,10 @@ export function isPublicChannel(channelInfo) {
 }
 
 export async function getChannelHistory(channel_id, limit = 100) {
+  const token = await getSlackBotToken();
+  if (!token) throw new Error("No Slack bot token (install app or set SLACK_BOT_TOKEN)");
   const resp = await axios.get("https://slack.com/api/conversations.history", {
-    headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+    headers: { Authorization: `Bearer ${token}` },
     params: { channel: channel_id, limit },
     timeout: SLACK_TIMEOUT_MS
   });
@@ -67,8 +126,10 @@ export async function getChannelHistory(channel_id, limit = 100) {
 }
 
 export async function getThreadHistory(channel_id, thread_ts) {
+  const token = await getSlackBotToken();
+  if (!token) throw new Error("No Slack bot token (install app or set SLACK_BOT_TOKEN)");
   const resp = await axios.get("https://slack.com/api/conversations.replies", {
-    headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+    headers: { Authorization: `Bearer ${token}` },
     params: { channel: channel_id, ts: thread_ts },
     timeout: SLACK_TIMEOUT_MS
   });
@@ -77,12 +138,14 @@ export async function getThreadHistory(channel_id, thread_ts) {
 }
 
 export async function slackPost(channel_id, text, thread_ts = null) {
+  const token = await getSlackBotToken();
+  if (!token) throw new Error("No Slack bot token (install app or set SLACK_BOT_TOKEN)");
   const payload = { channel: channel_id, text };
   if (thread_ts) {
     payload.thread_ts = thread_ts;
   }
   const resp = await axios.post("https://slack.com/api/chat.postMessage", payload, {
-    headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+    headers: { Authorization: `Bearer ${token}` },
     timeout: SLACK_TIMEOUT_MS
   });
   if (!resp.data?.ok) throw new Error(`Slack chat.postMessage error: ${resp.data?.error || "unknown_error"}`);
@@ -90,8 +153,10 @@ export async function slackPost(channel_id, text, thread_ts = null) {
 }
 
 export async function getBotUserId() {
+  const token = await getSlackBotToken();
+  if (!token) throw new Error("No Slack bot token (install app or set SLACK_BOT_TOKEN)");
   const resp = await axios.get("https://slack.com/api/auth.test", {
-    headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+    headers: { Authorization: `Bearer ${token}` },
     timeout: SLACK_TIMEOUT_MS
   });
   if (!resp.data?.ok) throw new Error(`Slack auth.test error: ${resp.data?.error || "unknown_error"}`);
