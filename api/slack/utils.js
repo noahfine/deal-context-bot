@@ -48,6 +48,7 @@ const SLACK_REFRESH_BUFFER_MS = 60 * 60 * 1000; // refresh 1 hour before expiry
 export async function getSlackBotToken() {
   // If env token is set, try Redis first for OAuth tokens; on any Redis failure, use env (restores original /summary behavior when Redis is unreachable)
   const envToken = process.env.SLACK_BOT_TOKEN || null;
+  console.log("[getSlackBotToken] SLACK_BOT_TOKEN set=%s", !!envToken);
 
   try {
     const redis = getRedis();
@@ -58,6 +59,7 @@ export async function getSlackBotToken() {
 
     const now = Date.now();
     if (access && expiresAtMs && now < expiresAtMs - SLACK_REFRESH_BUFFER_MS) {
+      console.log("[getSlackBotToken] using Redis token (not expired)");
       return access;
     }
 
@@ -96,13 +98,19 @@ export async function getSlackBotToken() {
     }
 
     // Prefer env token when Redis token is expired or refresh failed, so updated SLACK_BOT_TOKEN is used
-    return envToken || access;
+    if (envToken) {
+      console.log("[getSlackBotToken] using env token (Redis expired or refresh failed)");
+      return envToken;
+    }
+    console.log("[getSlackBotToken] using Redis access token (no env token)");
+    return access;
   } catch (err) {
     // Redis unreachable (e.g. ETIMEDOUT from Vercel) — use env token so /summary and Slack API still work
     if (envToken) {
-      console.warn("Redis unavailable for Slack token, using SLACK_BOT_TOKEN:", err.message);
+      console.warn("[getSlackBotToken] Redis unavailable, using SLACK_BOT_TOKEN:", err.message);
       return envToken;
     }
+    console.error("[getSlackBotToken] Redis failed and no env token:", err.message);
     throw err;
   }
 }
@@ -183,7 +191,11 @@ export async function getBotUserId() {
     headers: { Authorization: `Bearer ${token}` },
     timeout: SLACK_TIMEOUT_MS
   });
-  if (!resp.data?.ok) throw new Error(`Slack auth.test error: ${resp.data?.error || "unknown_error"}`);
+  if (!resp.data?.ok) {
+    const errMsg = resp.data?.error || "unknown_error";
+    console.error("[getBotUserId] auth.test failed:", errMsg);
+    throw new Error(`Slack auth.test error: ${errMsg}`);
+  }
   return resp.data.user_id;
 }
 
