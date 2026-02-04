@@ -72,6 +72,8 @@ async function handleAppMention(event) {
   const user_id = event.user;
   const text = event.text || "";
   const ts = event.ts;
+  const thread_ts = event.thread_ts || null;
+  console.log("[handleAppMention] channel=%s thread_ts=%s text=%s", channel_id, thread_ts || "(none)", text?.slice(0, 80));
 
   try {
     // Get bot user ID
@@ -204,19 +206,24 @@ async function handleAppMention(event) {
     // Get answer from OpenAI
     const answer = await callOpenAIForQA(prompt);
 
-    // Post response in channel
-    const response = await slackPost(channel_id, answer);
+    // Post response in thread if mention was in a thread, otherwise in channel
+    const response = await slackPost(channel_id, answer, thread_ts);
 
-    // Store thread context if response created a thread
-    if (response.ts) {
-      await storeThreadContext(channel_id, response.ts, [
+    // Store thread context if we have a thread (mention was in thread or we created one)
+    const responseThreadTs = thread_ts || response.ts;
+    if (responseThreadTs && response.ts) {
+      await storeThreadContext(channel_id, responseThreadTs, [
         { user: user_id, text: question, ts },
         { bot_id: botUserId, text: answer, ts: response.ts }
       ], dealId);
     }
   } catch (err) {
     console.error("Error handling app mention:", err);
-    await slackPost(channel_id, `Sorry, I encountered an error: ${err.message || "unknown_error"}`);
+    try {
+      await slackPost(channel_id, `Sorry, I encountered an error: ${err.message || "unknown_error"}`, thread_ts);
+    } catch (e) {
+      console.error("Failed to post error to Slack:", e.message);
+    }
   }
 }
 
@@ -226,9 +233,9 @@ async function handleThreadReply(event) {
   const user_id = event.user;
   const text = event.text || "";
   const ts = event.ts;
+  console.log("[handleThreadReply] channel=%s thread_ts=%s text=%s", channel_id, thread_ts, text?.slice(0, 80));
 
   if (!thread_ts) {
-    // Not a thread reply, ignore
     return;
   }
 
@@ -253,7 +260,7 @@ async function handleThreadReply(event) {
           (msg.ts === thread_ts && msg.user === botUserId)
       );
       if (!botMessage) {
-        // Bot didn't post in this thread, ignore
+        console.log("[handleThreadReply] no bot message in thread, ignoring. threadMessages count=%s", threadMessages?.length);
         return;
       }
       // Try to extract deal ID from context or fetch deal
@@ -399,7 +406,11 @@ async function handleThreadReply(event) {
     await addMessageToThread(channel_id, thread_ts, { bot_id: botUserId, text: answer, ts: response.ts });
   } catch (err) {
     console.error("Error handling thread reply:", err);
-    await slackPost(channel_id, `Sorry, I encountered an error: ${err.message || "unknown_error"}`, thread_ts);
+    try {
+      await slackPost(channel_id, `Sorry, I encountered an error: ${err.message || "unknown_error"}`, thread_ts);
+    } catch (e) {
+      console.error("Failed to post error to thread:", e.message);
+    }
   }
 }
 
@@ -434,6 +445,7 @@ export default async function handler(req, res) {
     // Handle event callbacks
     if (body.type === "event_callback") {
       const event = body.event;
+      console.log("[events] received event type=%s channel=%s thread_ts=%s", event?.type, event?.channel, event?.thread_ts ?? "(none)");
 
       // Handle app_mention events
       if (event.type === "app_mention") {
