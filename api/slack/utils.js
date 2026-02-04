@@ -196,7 +196,11 @@ export function extractQuestionFromMention(text, botUserId) {
 }
 
 export function isBotMessage(message) {
-  return message?.subtype === "bot" || message?.bot_id !== undefined;
+  return (
+    message?.subtype === "bot" ||
+    message?.subtype === "bot_message" ||
+    message?.bot_id !== undefined
+  );
 }
 
 // ===== Channel Name to Deal Query =====

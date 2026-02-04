@@ -245,8 +245,13 @@ async function handleThreadReply(event) {
     } else {
       // Fetch thread history from Slack
       const threadMessages = await getThreadHistory(channel_id, thread_ts);
-      // Check if bot posted in this thread
-      const botMessage = threadMessages.find((msg) => isBotMessage(msg) || msg.bot_id);
+      // Check if bot posted in this thread (parent may be our /summary or @DeCo reply)
+      const botMessage = threadMessages.find(
+        (msg) =>
+          isBotMessage(msg) ||
+          msg.bot_id !== undefined ||
+          (msg.ts === thread_ts && msg.user === botUserId)
+      );
       if (!botMessage) {
         // Bot didn't post in this thread, ignore
         return;
