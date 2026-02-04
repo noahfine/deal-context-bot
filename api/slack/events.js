@@ -78,16 +78,17 @@ async function handleAppMention(event) {
   try {
     // Get bot user ID
     const botUserId = await getBotUserId();
+    console.log("[handleAppMention] got bot user id, fetching channel info and deal...");
 
     // Extract question from mention
     const question = extractQuestionFromMention(text, botUserId);
     if (!question) {
-      await slackPost(channel_id, "I'm here! Ask me a question about this deal.");
+      await slackPost(channel_id, "I'm here! Ask me a question about this deal.", thread_ts);
       return;
     }
 
     // Get channel info and check if public
-    console.log("[handleAppMention] fetching channel info and deal...");
+    console.log("[handleAppMention] fetching channel info...");
     const channelInfo = await getSlackChannelInfo(channel_id);
     const isPublic = isPublicChannel(channelInfo);
     const channelName = channelInfo?.name || await getSlackChannelName(channel_id);
