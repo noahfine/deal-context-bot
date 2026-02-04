@@ -95,7 +95,8 @@ export async function getSlackBotToken() {
       }
     }
 
-    return access || envToken;
+    // Prefer env token when Redis token is expired or refresh failed, so updated SLACK_BOT_TOKEN is used
+    return envToken || access;
   } catch (err) {
     // Redis unreachable (e.g. ETIMEDOUT from Vercel) — use env token so /summary and Slack API still work
     if (envToken) {
