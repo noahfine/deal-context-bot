@@ -99,6 +99,15 @@ export async function getSlackBotToken() {
       }
     }
 
+    const isExpired = expiresAtMs && now >= expiresAtMs - SLACK_REFRESH_BUFFER_MS;
+    if (!access) {
+      throw new Error("No Slack bot token (install app or set SLACK_BOT_TOKEN)");
+    }
+    if (isExpired) {
+      throw new Error(
+        "Slack token expired and refresh failed; reinstall the app from Slack app settings (Install App)."
+      );
+    }
     return access;
   } catch (err) {
     console.warn("Redis unavailable for Slack token:", err.message);
