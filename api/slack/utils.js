@@ -180,10 +180,17 @@ export async function getBotUserId() {
   const token = await getSlackBotToken();
   if (!token) throw new Error("No Slack bot token (install app or set SLACK_BOT_TOKEN)");
   console.log("[getBotUserId] calling auth.test");
-  const resp = await axios.get("https://slack.com/api/auth.test", {
-    headers: { Authorization: `Bearer ${token}` },
-    timeout: SLACK_TIMEOUT_MS
-  });
+  let resp;
+  try {
+    resp = await axios.get("https://slack.com/api/auth.test", {
+      headers: { Authorization: `Bearer ${token}` },
+      timeout: 8000
+    });
+  } catch (err) {
+    const msg = err.response?.data?.error || err.code || err.message;
+    console.error("[getBotUserId] auth.test request failed:", msg);
+    throw err;
+  }
   if (!resp.data?.ok) {
     const errMsg = resp.data?.error || "unknown_error";
     console.error("[getBotUserId] auth.test failed:", errMsg);
