@@ -49,6 +49,7 @@ export async function getSlackBotToken() {
   const envToken = process.env.SLACK_BOT_TOKEN || null;
   // When env token is set, use it directly so we never block on Redis (Redis can hang from Vercel)
   if (envToken) {
+    console.log("[getSlackBotToken] returning env token");
     return envToken;
   }
 
@@ -175,8 +176,10 @@ export async function slackPost(channel_id, text, thread_ts = null) {
 }
 
 export async function getBotUserId() {
+  console.log("[getBotUserId] start");
   const token = await getSlackBotToken();
   if (!token) throw new Error("No Slack bot token (install app or set SLACK_BOT_TOKEN)");
+  console.log("[getBotUserId] calling auth.test");
   const resp = await axios.get("https://slack.com/api/auth.test", {
     headers: { Authorization: `Bearer ${token}` },
     timeout: SLACK_TIMEOUT_MS
@@ -186,6 +189,7 @@ export async function getBotUserId() {
     console.error("[getBotUserId] auth.test failed:", errMsg);
     throw new Error(`Slack auth.test error: ${errMsg}`);
   }
+  console.log("[getBotUserId] ok, user_id=", resp.data.user_id);
   return resp.data.user_id;
 }
 
