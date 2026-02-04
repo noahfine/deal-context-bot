@@ -44,6 +44,16 @@ export const redis = new Proxy({}, {
 // ===== Slack Bot Token (OAuth / token rotation) =====
 
 const SLACK_REFRESH_BUFFER_MS = 60 * 60 * 1000; // refresh 1 hour before expiry
+const REDIS_READ_TIMEOUT_MS = 4000; // fail fast from serverless if Redis is unreachable
+
+function withTimeout(promise, ms, message) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(message)), ms)
+    ),
+  ]);
+}
 
 export async function getSlackBotToken() {
   const envToken = process.env.SLACK_BOT_TOKEN || null;
@@ -55,9 +65,21 @@ export async function getSlackBotToken() {
 
   try {
     const redis = getRedis();
-    const access = await redis.get("slack:access_token");
-    const refresh = await redis.get("slack:refresh_token");
-    const expiresAtMsStr = await redis.get("slack:expires_at_ms");
+    const access = await withTimeout(
+      redis.get("slack:access_token"),
+      REDIS_READ_TIMEOUT_MS,
+      "Redis read timeout (Slack token). Redis may be unreachable from Vercel—try Upstash or check network."
+    );
+    const refresh = await withTimeout(
+      redis.get("slack:refresh_token"),
+      REDIS_READ_TIMEOUT_MS,
+      "Redis read timeout (Slack token). Redis may be unreachable from Vercel—try Upstash or check network."
+    );
+    const expiresAtMsStr = await withTimeout(
+      redis.get("slack:expires_at_ms"),
+      REDIS_READ_TIMEOUT_MS,
+      "Redis read timeout (Slack token). Redis may be unreachable from Vercel—try Upstash or check network."
+    );
     const expiresAtMs = expiresAtMsStr ? Number(expiresAtMsStr) : 0;
 
     const now = Date.now();
