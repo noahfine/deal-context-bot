@@ -87,6 +87,7 @@ async function handleAppMention(event) {
     }
 
     // Get channel info and check if public
+    console.log("[handleAppMention] fetching channel info and deal...");
     const channelInfo = await getSlackChannelInfo(channel_id);
     const isPublic = isPublicChannel(channelInfo);
     const channelName = channelInfo?.name || await getSlackChannelName(channel_id);
@@ -204,8 +205,9 @@ async function handleAppMention(event) {
     });
 
     // Get answer from OpenAI
+    console.log("[handleAppMention] calling OpenAI...");
     const answer = await callOpenAIForQA(prompt);
-
+    console.log("[handleAppMention] posting to Slack thread_ts=%s", thread_ts || "(channel)");
     // Post response in thread if mention was in a thread, otherwise in channel
     const response = await slackPost(channel_id, answer, thread_ts);
 
@@ -218,11 +220,11 @@ async function handleAppMention(event) {
       ], dealId);
     }
   } catch (err) {
-    console.error("Error handling app mention:", err);
+    console.error("Error handling app mention:", err?.message || err, err?.stack);
     try {
       await slackPost(channel_id, `Sorry, I encountered an error: ${err.message || "unknown_error"}`, thread_ts);
     } catch (e) {
-      console.error("Failed to post error to Slack:", e.message);
+      console.error("Failed to post error to Slack:", e?.message);
     }
   }
 }
@@ -268,6 +270,7 @@ async function handleThreadReply(event) {
     }
 
     // Get channel info
+    console.log("[handleThreadReply] fetching channel info and deal...");
     const channelInfo = await getSlackChannelInfo(channel_id);
     const isPublic = isPublicChannel(channelInfo);
     const channelName = channelInfo?.name || await getSlackChannelName(channel_id);
@@ -396,20 +399,20 @@ async function handleThreadReply(event) {
     });
 
     // Get answer
+    console.log("[handleThreadReply] calling OpenAI...");
     const answer = await callOpenAIForQA(prompt);
-
-    // Post reply in thread
+    console.log("[handleThreadReply] posting to Slack...");
     const response = await slackPost(channel_id, answer, thread_ts);
 
     // Update thread context
     await addMessageToThread(channel_id, thread_ts, { user: user_id, text, ts });
     await addMessageToThread(channel_id, thread_ts, { bot_id: botUserId, text: answer, ts: response.ts });
   } catch (err) {
-    console.error("Error handling thread reply:", err);
+    console.error("Error handling thread reply:", err?.message || err, err?.stack);
     try {
       await slackPost(channel_id, `Sorry, I encountered an error: ${err.message || "unknown_error"}`, thread_ts);
     } catch (e) {
-      console.error("Failed to post error to thread:", e.message);
+      console.error("Failed to post error to thread:", e?.message);
     }
   }
 }
@@ -467,10 +470,21 @@ export default async function handler(req, res) {
 
         // Acknowledge immediately
         res.status(200).send("OK");
-        // Process asynchronously
-        handleThreadReply(event).catch((err) => {
-          console.error("Error in async thread reply handler:", err);
-        });
+        // If this message @mentions the bot, Slack also sends app_mention — only process once via app_mention
+        (async () => {
+          try {
+            const botUserId = await getBotUserId();
+            if (event.text && event.text.includes(`<@${botUserId}>`)) {
+              console.log("[events] message is @mention in thread, skipping handleThreadReply (handled by app_mention)");
+              return;
+            }
+          } catch (e) {
+            console.error("[events] getBotUserId for dedupe check failed:", e?.message);
+          }
+          handleThreadReply(event).catch((err) => {
+            console.error("Error in async thread reply handler:", err?.message || err, err?.stack);
+          });
+        })();
         return;
       }
 
