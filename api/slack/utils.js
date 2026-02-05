@@ -44,7 +44,7 @@ export const redis = new Proxy({}, {
 // ===== Slack Bot Token (OAuth / token rotation) =====
 
 const SLACK_REFRESH_BUFFER_MS = 60 * 60 * 1000; // refresh 1 hour before expiry
-const REDIS_READ_TIMEOUT_MS = 4000; // fail fast from serverless if Redis is unreachable
+const REDIS_READ_TIMEOUT_MS = 2000; // fail fast from serverless if Redis is unreachable
 
 function withTimeout(promise, ms, message) {
   return Promise.race([
@@ -63,6 +63,7 @@ export async function getSlackBotToken() {
     return envToken;
   }
 
+  console.log("[getSlackBotToken] reading from Redis (timeout %sms)...", REDIS_READ_TIMEOUT_MS);
   try {
     const redis = getRedis();
     const access = await withTimeout(
@@ -132,7 +133,7 @@ export async function getSlackBotToken() {
     }
     return access;
   } catch (err) {
-    console.warn("Redis unavailable for Slack token:", err.message);
+    console.error("[getSlackBotToken] Redis error or timeout:", err.message);
     throw err;
   }
 }
