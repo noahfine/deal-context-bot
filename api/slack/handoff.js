@@ -1,11 +1,19 @@
 import crypto from "crypto";
 import axios from "axios";
 import { waitUntil } from "@vercel/functions";
-import { getSlackChannelName, slackPost, channelNameToDealQuery, getRedis } from "./utils.js";
-
-const SLACK_TIMEOUT_MS = 2500;
-const HUBSPOT_TIMEOUT_MS = 10000;
-const OPENAI_TIMEOUT_MS = 20000;
+import {
+  getSlackChannelName,
+  slackPost,
+  channelNameToDealQuery,
+  getHubSpotAccessToken,
+  hubspotClient,
+  findBestDeal,
+  getDealAssociations,
+  batchRead,
+  resolveOwnerName,
+  daysBetweenISO
+} from "./utils.js";
+import { callOpenAIForQA } from "./openai-qa.js";
 
 function verifySlackRequest(req, rawBody) {
   const timestamp = req.headers["x-slack-request-timestamp"];
@@ -40,6 +48,9 @@ async function readRawBody(req) {
   });
 }
 
+// Vercel Hobby plan has a 10s function timeout
+const VERCEL_TIMEOUT_WARNING_MS = 8000;
+
 async function postToResponseUrl(responseUrl, text, replaceOriginal = false) {
   if (!responseUrl) return;
   try {
@@ -53,172 +64,7 @@ async function postToResponseUrl(responseUrl, text, replaceOriginal = false) {
   }
 }
 
-async function hubspotTokenExchange(form) {
-  const resp = await axios.post("https://api.hubapi.com/oauth/v1/token", form, {
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    timeout: HUBSPOT_TIMEOUT_MS
-  });
-  return resp.data;
-}
-
-async function getHubSpotAccessToken() {
-  const redis = getRedis();
-  const access = await redis.get("hubspot:access_token");
-  const refresh = await redis.get("hubspot:refresh_token");
-  const expiresAtMsStr = await redis.get("hubspot:expires_at_ms");
-  const expiresAtMs = expiresAtMsStr ? Number(expiresAtMsStr) : 0;
-
-  if (!refresh) throw new Error("HubSpot not connected: missing refresh token in Redis");
-
-  const now = Date.now();
-  const bufferMs = 60 * 1000; // refresh 60s early
-  if (access && expiresAtMs && now < expiresAtMs - bufferMs) return access;
-
-  // Refresh
-  const form = new URLSearchParams();
-  form.set("grant_type", "refresh_token");
-  form.set("client_id", process.env.HUBSPOT_CLIENT_ID);
-  form.set("client_secret", process.env.HUBSPOT_CLIENT_SECRET);
-  form.set("refresh_token", refresh);
-
-  const data = await hubspotTokenExchange(form);
-  const newAccess = data.access_token;
-  const expiresIn = Number(data.expires_in || 0);
-  const newExpiresAt = Date.now() + expiresIn * 1000;
-
-  await redis.set("hubspot:access_token", newAccess);
-  await redis.set("hubspot:expires_at_ms", String(newExpiresAt));
-
-  return newAccess;
-}
-
-function hubspotClient(accessToken) {
-  return axios.create({
-    baseURL: "https://api.hubapi.com",
-    headers: { Authorization: `Bearer ${accessToken}` },
-    timeout: HUBSPOT_TIMEOUT_MS
-  });
-}
-
-async function findBestDeal(hs, dealQuery) {
-  // Search deals by name. We'll bias toward Closed Won + most recent closedate.
-  // Endpoint: POST /crm/v3/objects/deals/search
-  const body = {
-    filterGroups: [
-      {
-        filters: [
-          { propertyName: "dealname", operator: "CONTAINS_TOKEN", value: dealQuery }
-        ]
-      }
-    ],
-    properties: ["dealname", "createdate", "closedate", "dealstage", "pipeline", "hubspot_owner_id"],
-    limit: 10
-  };
-
-  const resp = await hs.post("/crm/v3/objects/deals/search", body);
-  const results = resp.data?.results || [];
-  if (!results.length) return null;
-
-  // prefer closed won if we can detect it by stage label isn't available here.
-  // We'll just pick the one with the most recent closedate if present.
-  results.sort((a, b) => {
-    const ac = a.properties?.closedate ? Number(new Date(a.properties.closedate)) : 0;
-    const bc = b.properties?.closedate ? Number(new Date(b.properties.closedate)) : 0;
-    return bc - ac;
-  });
-
-  return results[0];
-}
-
-async function getDealAssociations(hs, dealId) {
-  // Grab associated contacts + company ids
-  const [contacts, companies] = await Promise.allSettled([
-    hs.get(`/crm/v4/objects/deals/${dealId}/associations/contacts`),
-    hs.get(`/crm/v4/objects/deals/${dealId}/associations/companies`)
-  ]);
-
-  const contactIds =
-    contacts.status === "fulfilled"
-      ? (contacts.value.data?.results || []).map((r) => r.toObjectId).filter(Boolean)
-      : [];
-
-  const companyIds =
-    companies.status === "fulfilled"
-      ? (companies.value.data?.results || []).map((r) => r.toObjectId).filter(Boolean)
-      : [];
-
-  return { contactIds, companyIds };
-}
-
-async function batchRead(hs, objectType, ids, properties) {
-  if (!ids.length) return [];
-  const resp = await hs.post(`/crm/v3/objects/${objectType}/batch/read`, {
-    inputs: ids.slice(0, 50).map((id) => ({ id })),
-    properties
-  });
-  return resp.data?.results || [];
-}
-
-async function resolveOwnerName(hs, ownerId) {
-  if (!ownerId) return null;
-  try {
-    const resp = await hs.get(`/crm/v3/owners/${ownerId}`);
-    const o = resp.data;
-    const name = [o?.firstName, o?.lastName].filter(Boolean).join(" ").trim();
-    return name || null;
-  } catch {
-    return null;
-  }
-}
-
-function daysBetweenISO(a, b) {
-  if (!a || !b) return null;
-  const da = new Date(a).getTime();
-  const db = new Date(b).getTime();
-  if (!da || !db) return null;
-  const diff = Math.round((db - da) / (1000 * 60 * 60 * 24));
-  return diff;
-}
-
-async function callOpenAI(promptText) {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
-
-  // Using Responses API
-  const resp = await axios.post(
-    "https://api.openai.com/v1/responses",
-    {
-      model: "gpt-4.1-mini",
-      input: promptText
-    },
-    {
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      timeout: OPENAI_TIMEOUT_MS
-    }
-  );
-
-  // Extract text
-  const output = resp.data?.output || [];
-  const text = output
-    .flatMap((o) => o.content || [])
-    .filter((c) => c.type === "output_text")
-    .map((c) => c.text)
-    .join("\n")
-    .trim();
-
-  return text;
-}
-
 function buildPromptFromHubSpotData({ dealName, hubspotDealUrl, ownerLine, created, closed, cycleDays, contactsLine, notesSummary }) {
-  /* ===== MANUAL INPUT REQUIRED HERE =====
-     Paste your production prompt template (system+user rules) into this string,
-     but DO NOT include “Find the HubSpot deal named ...” as an instruction.
-     Instead, we provide the deal context directly below.
-
-     You can paste your text exactly and just change the first sentence to:
-     "Using the HubSpot data below for deal {dealName}, produce exactly 3–5 bullets..."
-  ====================================== */
-
   const instructions = `
 You are generating a post-sales handoff summary for a project Slack channel. Be concise, factual, and write like a salesperson giving a short verbal handoff to Deployments and Customer Success.
 
@@ -257,7 +103,6 @@ export default async function handler(req, res) {
 
   const payload = Object.fromEntries(new URLSearchParams(rawBody));
   const channel_id = payload.channel_id;
-  const team_id = payload.team_id;
   const response_url = payload.response_url;
 
   // Respond within 3 seconds or Slack shows "operation_timeout"
@@ -266,7 +111,22 @@ export default async function handler(req, res) {
     text: "Generating deal summary... (this may take a moment)"
   });
 
-  // Keep function alive until work completes and we post to response_url (Vercel would otherwise stop after res.json)
+  // Keep function alive until work completes (Vercel would otherwise stop after res.json)
+  // Set a timer to warn via response_url if we're approaching the Vercel Hobby timeout
+  let summaryFinished = false;
+  const timeoutWarning = setTimeout(async () => {
+    if (!summaryFinished && response_url) {
+      console.warn("[/summary] approaching Vercel timeout, posting warning");
+      await postToResponseUrl(
+        response_url,
+        "Still generating the summary, but it's taking longer than expected. " +
+        "If you don't see a response shortly, the Vercel function may have timed out (10s limit on Hobby plan). " +
+        "Try running /summary again.",
+        false
+      );
+    }
+  }, VERCEL_TIMEOUT_WARNING_MS);
+
   waitUntil(
     (async () => {
       try {
@@ -338,7 +198,10 @@ export default async function handler(req, res) {
           // leave default
         }
 
-        const hubspotDealUrl = `https://app.hubspot.com/contacts/${team_id}/deal/${dealId}`;
+        const portalId = process.env.HUBSPOT_PORTAL_ID;
+        const hubspotDealUrl = portalId
+          ? `https://app.hubspot.com/contacts/${portalId}/deal/${dealId}`
+          : `https://app.hubspot.com/deals/${dealId}`;
         const prompt = buildPromptFromHubSpotData({
           dealName,
           hubspotDealUrl,
@@ -350,10 +213,14 @@ export default async function handler(req, res) {
           notesSummary: `${notesSummary}${companyLine !== "Not observed in HubSpot history" ? ` (Company: ${companyLine})` : ""}`
         });
 
-        const summaryText = await callOpenAI(prompt);
+        const summaryText = await callOpenAIForQA(prompt);
         await slackPost(channel_id, summaryText);
+        summaryFinished = true;
+        clearTimeout(timeoutWarning);
         await postToResponseUrl(response_url, `Posted deal summary to #${channelName}.`, true);
       } catch (err) {
+        summaryFinished = true;
+        clearTimeout(timeoutWarning);
         console.error("/summary error:", err?.message || err, err?.code);
         let msg = err?.response?.data ? JSON.stringify(err.response.data) : (err?.message || "unknown_error");
         if (err?.code === "ETIMEDOUT" || msg.includes("ETIMEDOUT")) {
@@ -372,4 +239,3 @@ export default async function handler(req, res) {
     })()
   );
 }
-

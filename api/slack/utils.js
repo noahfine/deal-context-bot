@@ -46,6 +46,12 @@ export const redis = new Proxy({}, {
 const SLACK_REFRESH_BUFFER_MS = 60 * 60 * 1000; // refresh 1 hour before expiry
 const REDIS_READ_TIMEOUT_MS = 2000; // fail fast from serverless if Redis is unreachable
 
+// In-memory token cache — survives within a single invocation and across
+// warm invocations on Vercel. Eliminates repeated Redis reads per request.
+let _cachedSlackBotToken = null;
+let _cachedSlackBotTokenExpiresAt = 0;
+const SLACK_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
 function withTimeout(promise, ms, message) {
   return Promise.race([
     promise,
@@ -55,36 +61,50 @@ function withTimeout(promise, ms, message) {
   ]);
 }
 
+/** Returns the cached Slack bot token synchronously, or null if not cached.
+ *  Use this in error handlers to avoid a Redis round trip. */
+export function getCachedSlackBotToken() {
+  const envToken = process.env.SLACK_BOT_TOKEN || null;
+  if (envToken) return envToken;
+  if (_cachedSlackBotToken && Date.now() < _cachedSlackBotTokenExpiresAt) {
+    return _cachedSlackBotToken;
+  }
+  return null;
+}
+
 export async function getSlackBotToken() {
   const envToken = process.env.SLACK_BOT_TOKEN || null;
-  // When env token is set, use it directly so we never block on Redis (Redis can hang from Vercel)
+  // When env token is set, use it directly so we never block on Redis
   if (envToken) {
     console.log("[getSlackBotToken] returning env token");
     return envToken;
   }
 
+  // Check in-memory cache first
+  if (_cachedSlackBotToken && Date.now() < _cachedSlackBotTokenExpiresAt) {
+    console.log("[getSlackBotToken] returning cached token");
+    return _cachedSlackBotToken;
+  }
+
   console.log("[getSlackBotToken] reading from Redis (timeout %sms)...", REDIS_READ_TIMEOUT_MS);
   try {
-    const redis = getRedis();
-    const access = await withTimeout(
-      redis.get("slack:access_token"),
+    const r = getRedis();
+    // Batch all 3 reads into a single timeout window
+    const [access, refresh, expiresAtMsStr] = await withTimeout(
+      Promise.all([
+        r.get("slack:access_token"),
+        r.get("slack:refresh_token"),
+        r.get("slack:expires_at_ms"),
+      ]),
       REDIS_READ_TIMEOUT_MS,
-      "Redis read timeout (Slack token). Redis may be unreachable from Vercel—try Upstash or check network."
-    );
-    const refresh = await withTimeout(
-      redis.get("slack:refresh_token"),
-      REDIS_READ_TIMEOUT_MS,
-      "Redis read timeout (Slack token). Redis may be unreachable from Vercel—try Upstash or check network."
-    );
-    const expiresAtMsStr = await withTimeout(
-      redis.get("slack:expires_at_ms"),
-      REDIS_READ_TIMEOUT_MS,
-      "Redis read timeout (Slack token). Redis may be unreachable from Vercel—try Upstash or check network."
+      "Redis read timeout (Slack token). Redis may be unreachable from Vercel."
     );
     const expiresAtMs = expiresAtMsStr ? Number(expiresAtMsStr) : 0;
 
     const now = Date.now();
     if (access && expiresAtMs && now < expiresAtMs - SLACK_REFRESH_BUFFER_MS) {
+      _cachedSlackBotToken = access;
+      _cachedSlackBotTokenExpiresAt = Date.now() + SLACK_CACHE_TTL_MS;
       return access;
     }
 
@@ -111,9 +131,11 @@ export async function getSlackBotToken() {
             const newRefresh = resp.data.refresh_token;
             const expiresIn = Number(resp.data.expires_in ?? 43200);
             const newExpiresAt = Date.now() + expiresIn * 1000;
-            await redis.set("slack:access_token", newAccess);
-            await redis.set("slack:expires_at_ms", String(newExpiresAt));
-            if (newRefresh) await redis.set("slack:refresh_token", newRefresh);
+            await r.set("slack:access_token", newAccess);
+            await r.set("slack:expires_at_ms", String(newExpiresAt));
+            if (newRefresh) await r.set("slack:refresh_token", newRefresh);
+            _cachedSlackBotToken = newAccess;
+            _cachedSlackBotTokenExpiresAt = Date.now() + SLACK_CACHE_TTL_MS;
             return newAccess;
           }
         } catch (err) {
@@ -131,6 +153,8 @@ export async function getSlackBotToken() {
         "Slack token expired and refresh failed; reinstall the app from Slack app settings (Install App)."
       );
     }
+    _cachedSlackBotToken = access;
+    _cachedSlackBotTokenExpiresAt = Date.now() + SLACK_CACHE_TTL_MS;
     return access;
   } catch (err) {
     console.error("[getSlackBotToken] Redis error or timeout:", err.message);
@@ -296,17 +320,39 @@ export async function hubspotTokenExchange(form) {
   return resp.data;
 }
 
+// In-memory cache for HubSpot token (same pattern as Slack)
+let _cachedHubSpotToken = null;
+let _cachedHubSpotTokenExpiresAt = 0;
+const HUBSPOT_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
 export async function getHubSpotAccessToken() {
-  const access = await redis.get("hubspot:access_token");
-  const refresh = await redis.get("hubspot:refresh_token");
-  const expiresAtMsStr = await redis.get("hubspot:expires_at_ms");
+  // Check in-memory cache first
+  if (_cachedHubSpotToken && Date.now() < _cachedHubSpotTokenExpiresAt) {
+    console.log("[getHubSpotAccessToken] returning cached token");
+    return _cachedHubSpotToken;
+  }
+
+  const r = getRedis();
+  const [access, refresh, expiresAtMsStr] = await withTimeout(
+    Promise.all([
+      r.get("hubspot:access_token"),
+      r.get("hubspot:refresh_token"),
+      r.get("hubspot:expires_at_ms"),
+    ]),
+    REDIS_READ_TIMEOUT_MS,
+    "Redis read timeout (HubSpot token)."
+  );
   const expiresAtMs = expiresAtMsStr ? Number(expiresAtMsStr) : 0;
 
   if (!refresh) throw new Error("HubSpot not connected: missing refresh token in Redis");
 
   const now = Date.now();
   const bufferMs = 60 * 1000; // refresh 60s early
-  if (access && expiresAtMs && now < expiresAtMs - bufferMs) return access;
+  if (access && expiresAtMs && now < expiresAtMs - bufferMs) {
+    _cachedHubSpotToken = access;
+    _cachedHubSpotTokenExpiresAt = Date.now() + HUBSPOT_CACHE_TTL_MS;
+    return access;
+  }
 
   // Refresh
   const form = new URLSearchParams();
@@ -320,9 +366,11 @@ export async function getHubSpotAccessToken() {
   const expiresIn = Number(data.expires_in || 0);
   const newExpiresAt = Date.now() + expiresIn * 1000;
 
-  await redis.set("hubspot:access_token", newAccess);
-  await redis.set("hubspot:expires_at_ms", String(newExpiresAt));
+  await r.set("hubspot:access_token", newAccess);
+  await r.set("hubspot:expires_at_ms", String(newExpiresAt));
 
+  _cachedHubSpotToken = newAccess;
+  _cachedHubSpotTokenExpiresAt = Date.now() + HUBSPOT_CACHE_TTL_MS;
   return newAccess;
 }
 

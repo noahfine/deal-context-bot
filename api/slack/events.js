@@ -1,4 +1,6 @@
 import crypto from "crypto";
+import { waitUntil } from "@vercel/functions";
+import axios from "axios";
 import {
   getSlackChannelName,
   getSlackChannelInfo,
@@ -12,14 +14,14 @@ import {
   channelNameToDealQuery,
   storeThreadContext,
   getThreadContext,
-  addMessageToThread,
   getHubSpotAccessToken,
   hubspotClient,
   findBestDeal,
   getDealAssociations,
   batchRead,
   resolveOwnerName,
-  daysBetweenISO
+  daysBetweenISO,
+  getCachedSlackBotToken
 } from "./utils.js";
 import {
   determineRequiredData,
@@ -31,8 +33,6 @@ import {
   formatNotesForPrompt
 } from "./hubspot-data.js";
 import { buildQAPrompt, callOpenAIForQA } from "./openai-qa.js";
-
-const SLACK_TIMEOUT_MS = 2500;
 
 function verifySlackRequest(req, rawBody) {
   const timestamp = req.headers["x-slack-request-timestamp"];
@@ -65,6 +65,65 @@ async function readRawBody(req) {
     req.on("end", () => resolve(data));
     req.on("error", reject);
   });
+}
+
+// Vercel Hobby plan has a 10s function timeout. We post a notification if the
+// handler is still running after this threshold so the user knows it's working.
+const VERCEL_TIMEOUT_WARNING_MS = 8000;
+
+/** Post an error message to Slack using the cached token (no Redis round trip).
+ *  Fails silently if no cached token is available. */
+async function safeErrorPost(channel_id, text, thread_ts = null) {
+  const token = getCachedSlackBotToken();
+  if (!token) {
+    console.error("[safeErrorPost] no cached token available, cannot post error to Slack");
+    return;
+  }
+  try {
+    const payload = { channel: channel_id, text };
+    if (thread_ts) payload.thread_ts = thread_ts;
+    await axios.post("https://slack.com/api/chat.postMessage", payload, {
+      headers: { Authorization: `Bearer ${token}` },
+      timeout: 8000
+    });
+  } catch (e) {
+    console.error("[safeErrorPost] failed:", e?.message);
+  }
+}
+
+/** Race the handler against a timeout. If the handler takes too long, post a
+ *  warning to Slack so the user knows the function is working but hit the
+ *  Vercel Hobby plan limit. The handler continues to run — `waitUntil` may
+ *  keep it alive — but the user gets feedback either way. */
+async function withTimeoutNotification(handlerPromise, channel_id, thread_ts) {
+  let finished = false;
+
+  const timeoutPromise = new Promise((resolve) => {
+    setTimeout(async () => {
+      if (!finished) {
+        console.warn("[timeout] handler exceeded %sms, posting warning", VERCEL_TIMEOUT_WARNING_MS);
+        await safeErrorPost(
+          channel_id,
+          "Still working on your request, but it's taking longer than expected. " +
+          "If you don't see a response shortly, the Vercel function may have timed out (10s limit on Hobby plan). " +
+          "Try again or ask a simpler question.",
+          thread_ts
+        );
+      }
+      resolve();
+    }, VERCEL_TIMEOUT_WARNING_MS);
+  });
+
+  try {
+    const result = await Promise.race([
+      handlerPromise.then((r) => { finished = true; return r; }),
+      timeoutPromise
+    ]);
+    return result;
+  } catch (err) {
+    finished = true;
+    throw err;
+  }
 }
 
 async function handleAppMention(event) {
@@ -182,13 +241,33 @@ async function handleAppMention(event) {
       notes = formatNotesForPrompt(notes);
     }
 
-    const hubspotDealUrl = `https://app.hubspot.com/contacts/${event.team}/deal/${dealId}`;
+    const portalId = process.env.HUBSPOT_PORTAL_ID;
+    const hubspotDealUrl = portalId
+      ? `https://app.hubspot.com/contacts/${portalId}/deal/${dealId}`
+      : `https://app.hubspot.com/deals/${dealId}`;
+
+    // Load thread context if this @mention is inside an existing thread
+    let threadContext = null;
+    if (thread_ts) {
+      threadContext = await getThreadContext(channel_id, thread_ts);
+      if (!threadContext) {
+        // No cached context — fetch thread history from Slack
+        try {
+          const threadMessages = await getThreadHistory(channel_id, thread_ts);
+          if (threadMessages && threadMessages.length > 0) {
+            threadContext = { messages: threadMessages };
+          }
+        } catch (err) {
+          console.error("[handleAppMention] error fetching thread history:", err.message);
+        }
+      }
+    }
 
     // Build Q&A prompt
     const prompt = buildQAPrompt({
       question,
       dealData: { dealId, dealName },
-      threadContext: null, // No thread context for @mentions
+      threadContext,
       hubspotData: {
         dealName,
         hubspotDealUrl,
@@ -222,199 +301,7 @@ async function handleAppMention(event) {
     }
   } catch (err) {
     console.error("Error handling app mention:", err?.message || err, err?.stack);
-    try {
-      await slackPost(channel_id, `Sorry, I encountered an error: ${err.message || "unknown_error"}`, thread_ts);
-    } catch (e) {
-      console.error("Failed to post error to Slack:", e?.message);
-    }
-  }
-}
-
-async function handleThreadReply(event) {
-  const channel_id = event.channel;
-  const thread_ts = event.thread_ts;
-  const user_id = event.user;
-  const text = event.text || "";
-  const ts = event.ts;
-  console.log("[handleThreadReply] channel=%s thread_ts=%s text=%s", channel_id, thread_ts, text?.slice(0, 80));
-
-  if (!thread_ts) {
-    return;
-  }
-
-  try {
-    // Get bot user ID
-    const botUserId = await getBotUserId();
-
-    // Get thread context from Redis or fetch from Slack
-    let threadContext = await getThreadContext(channel_id, thread_ts);
-    let dealId = null;
-
-    if (threadContext) {
-      dealId = threadContext.dealId;
-    } else {
-      // Fetch thread history from Slack
-      const threadMessages = await getThreadHistory(channel_id, thread_ts);
-      // Check if bot posted in this thread (parent may be our /summary or @DeCo reply)
-      const botMessage = threadMessages.find(
-        (msg) =>
-          isBotMessage(msg) ||
-          msg.bot_id !== undefined ||
-          (msg.ts === thread_ts && msg.user === botUserId)
-      );
-      if (!botMessage) {
-        console.log("[handleThreadReply] no bot message in thread, ignoring. threadMessages count=%s", threadMessages?.length);
-        return;
-      }
-      // Try to extract deal ID from context or fetch deal
-      threadContext = { messages: threadMessages };
-    }
-
-    // Get channel info
-    console.log("[handleThreadReply] fetching channel info and deal...");
-    const channelInfo = await getSlackChannelInfo(channel_id);
-    const isPublic = isPublicChannel(channelInfo);
-    const channelName = channelInfo?.name || await getSlackChannelName(channel_id);
-
-    // Get deal
-    let dealId_final = dealId;
-    let deal = null;
-    
-    const accessToken = await getHubSpotAccessToken();
-    const hs = hubspotClient(accessToken);
-    
-    if (!dealId_final) {
-      const dealQuery = channelNameToDealQuery(channelName);
-      deal = await findBestDeal(hs, dealQuery);
-      if (!deal) {
-        await slackPost(channel_id, `No HubSpot deal found matching "${dealQuery}".`, thread_ts);
-        return;
-      }
-      dealId_final = deal.id;
-    } else {
-      // Still need to fetch deal for properties
-      const dealQuery = channelNameToDealQuery(channelName);
-      deal = await findBestDeal(hs, dealQuery);
-      if (!deal) {
-        await slackPost(channel_id, `No HubSpot deal found matching "${dealQuery}".`, thread_ts);
-        return;
-      }
-      dealId_final = deal.id;
-    }
-    const dealName = deal.properties?.dealname || channelNameToDealQuery(channelName);
-    const created = deal.properties?.createdate || null;
-    const closed = deal.properties?.closedate || null;
-    const cycleDays = daysBetweenISO(created, closed);
-
-    const ownerId = deal.properties?.hubspot_owner_id || null;
-    const ownerName = await resolveOwnerName(hs, ownerId);
-    const ownerLine = ownerName
-      ? `${ownerName} (Sales)`
-      : ownerId
-        ? `${ownerId} (name not found in HubSpot)`
-        : "Not observed in HubSpot history";
-
-    // Fetch channel history if public
-    let channelHistory = null;
-    if (isPublic) {
-      try {
-        channelHistory = await getChannelHistory(channel_id, 100);
-        channelHistory = channelHistory.filter(
-          (msg) => !isBotMessage(msg) && !msg.subtype && msg.text
-        );
-      } catch (err) {
-        console.error("Error fetching channel history:", err.message);
-      }
-    }
-
-    // Determine required data
-    const requiredData = determineRequiredData(text, deal);
-
-    // Fetch basic data
-    const { contactIds, companyIds } = await getDealAssociations(hs, dealId_final);
-    const contacts = await batchRead(hs, "contacts", contactIds, ["firstname", "lastname", "jobtitle", "email"]);
-    const companies = await batchRead(hs, "companies", companyIds, ["name", "domain"]);
-
-    const contactsLine = contacts.length
-      ? contacts
-          .slice(0, 6)
-          .map((c) => {
-            const p = c.properties || {};
-            const nm = [p.firstname, p.lastname].filter(Boolean).join(" ").trim() || "Name not observed";
-            const role = p.jobtitle ? `, ${p.jobtitle}` : "";
-            const email = p.email ? ` (${p.email})` : "";
-            return `${nm}${role}${email}`;
-          })
-          .join("; ")
-      : "Not observed in HubSpot history";
-
-    const companyLine = companies.length
-      ? companies
-          .slice(0, 2)
-          .map((c) => c.properties?.name)
-          .filter(Boolean)
-          .join("; ")
-      : "Not observed in HubSpot history";
-
-    // Fetch additional data on-demand
-    let engagements = null;
-    let activities = null;
-    let notes = null;
-
-    if (requiredData.engagements) {
-      engagements = await fetchDealEngagements(hs, dealId_final);
-      engagements = formatEngagementsForPrompt(engagements);
-    }
-
-    if (requiredData.activities) {
-      activities = await fetchDealActivities(hs, dealId_final);
-      activities = formatActivitiesForPrompt(activities);
-    }
-
-    if (requiredData.notes) {
-      notes = await fetchDealNotes(hs, dealId_final);
-      notes = formatNotesForPrompt(notes);
-    }
-
-    const hubspotDealUrl = `https://app.hubspot.com/contacts/${event.team}/deal/${dealId_final}`;
-
-    // Build Q&A prompt with thread context
-    const prompt = buildQAPrompt({
-      question: text,
-      dealData: { dealId: dealId_final, dealName },
-      threadContext,
-      hubspotData: {
-        dealName,
-        hubspotDealUrl,
-        ownerLine,
-        created,
-        closed,
-        cycleDays,
-        contactsLine,
-        companyLine,
-        engagements,
-        activities,
-        notes
-      },
-      channelHistory
-    });
-
-    // Get answer
-    console.log("[handleThreadReply] calling OpenAI...");
-    const answer = await callOpenAIForQA(prompt);
-    console.log("[handleThreadReply] posting to Slack...");
-    const response = await slackPost(channel_id, answer, thread_ts);
-
-    // Update thread context
-    await addMessageToThread(channel_id, thread_ts, { user: user_id, text, ts });
-    await addMessageToThread(channel_id, thread_ts, { bot_id: botUserId, text: answer, ts: response.ts });
-  } catch (err) {
-    console.error("Error handling thread reply:", err?.message || err, err?.stack);
-    try {
-      await slackPost(channel_id, `Sorry, I encountered an error: ${err.message || "unknown_error"}`, thread_ts);
-    } catch (e) {
-      console.error("Failed to post error to thread:", e?.message);
-    }
+    await safeErrorPost(channel_id, `Sorry, I encountered an error: ${err.message || "unknown_error"}`, thread_ts);
   }
 }
 
@@ -455,38 +342,24 @@ export default async function handler(req, res) {
       if (event.type === "app_mention") {
         // Acknowledge immediately (Slack requires response within 3 seconds)
         res.status(200).send("OK");
-        // Process asynchronously
-        handleAppMention(event).catch((err) => {
-          console.error("Error in async app_mention handler:", err);
-        });
+        // Process asynchronously — waitUntil keeps the function alive on Vercel
+        waitUntil(
+          withTimeoutNotification(
+            handleAppMention(event),
+            event.channel,
+            event.thread_ts || null
+          ).catch((err) => {
+            console.error("Error in async app_mention handler:", err);
+          })
+        );
         return;
       }
 
-      // Handle message events (for thread replies)
+      // Thread replies without @mention are ignored — bot only responds to @mentions.
+      // When a user @mentions the bot in a thread, Slack sends both a "message" event
+      // and an "app_mention" event. We handle it via app_mention above.
       if (event.type === "message") {
-        // Ignore bot messages and messages without thread_ts
-        if (isBotMessage(event) || !event.thread_ts) {
-          return res.status(200).send("OK");
-        }
-
-        // Acknowledge immediately
-        res.status(200).send("OK");
-        // If this message @mentions the bot, Slack also sends app_mention — only process once via app_mention
-        (async () => {
-          try {
-            const botUserId = await getBotUserId();
-            if (event.text && event.text.includes(`<@${botUserId}>`)) {
-              console.log("[events] message is @mention in thread, skipping handleThreadReply (handled by app_mention)");
-              return;
-            }
-          } catch (e) {
-            console.error("[events] getBotUserId for dedupe check failed:", e?.message);
-          }
-          handleThreadReply(event).catch((err) => {
-            console.error("Error in async thread reply handler:", err?.message || err, err?.stack);
-          });
-        })();
-        return;
+        return res.status(200).send("OK");
       }
 
       // Unknown event type, just acknowledge
