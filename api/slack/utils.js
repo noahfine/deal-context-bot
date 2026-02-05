@@ -391,7 +391,7 @@ export async function findBestDeal(hs, dealQuery) {
         ]
       }
     ],
-    properties: ["dealname", "createdate", "closedate", "dealstage", "pipeline", "hubspot_owner_id"],
+    properties: ["dealname", "createdate", "closedate", "dealstage", "pipeline", "hubspot_owner_id", "amount", "dealtype", "description", "deal_currency_code"],
     limit: 10
   };
 

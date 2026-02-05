@@ -29,7 +29,9 @@ import {
   fetchDealCalls,
   fetchDealMeetings,
   fetchDealNotes,
-  formatTimelineForPrompt
+  fetchDealLineItems,
+  formatTimelineForPrompt,
+  formatLineItemsForPrompt
 } from "./hubspot-data.js";
 import { buildQAPrompt, callOpenAIForQA } from "./openai-qa.js";
 
@@ -199,6 +201,7 @@ async function handleAppMention(event) {
     const phase3 = {
       owner: resolveOwnerName(hs, ownerId),
       associations: getDealAssociations(hs, dealId),
+      lineItems: fetchDealLineItems(hs, dealId),
       emails: requiredData.emails ? fetchDealEmails(hs, dealId) : Promise.resolve([]),
       notes: requiredData.notes ? fetchDealNotes(hs, dealId) : Promise.resolve([]),
       calls: requiredData.calls ? fetchDealCalls(hs, dealId) : Promise.resolve([]),
@@ -261,6 +264,15 @@ async function handleAppMention(event) {
 
     // Build unified timeline from all activity types
     const timeline = formatTimelineForPrompt(r.emails, r.calls, r.meetings, r.notes);
+    const lineItems = formatLineItemsForPrompt(r.lineItems);
+
+    const amount = deal.properties?.amount
+      ? `${deal.properties.deal_currency_code || "$"}${Number(deal.properties.amount).toLocaleString()}`
+      : null;
+    const dealType = deal.properties?.dealtype || null;
+    const dealStage = deal.properties?.dealstage || null;
+    const pipelineName = deal.properties?.pipeline || null;
+    const description = deal.properties?.description || null;
 
     // ── Phase 4: OpenAI + post to Slack ──
     const prompt = buildQAPrompt({
@@ -276,6 +288,12 @@ async function handleAppMention(event) {
         cycleDays,
         contactsLine,
         companyLine,
+        amount,
+        dealType,
+        dealStage,
+        pipelineName,
+        description,
+        lineItems,
         timeline
       },
       channelHistory

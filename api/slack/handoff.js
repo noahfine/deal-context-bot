@@ -18,7 +18,9 @@ import {
   fetchDealCalls,
   fetchDealMeetings,
   fetchDealNotes,
-  formatTimelineForPrompt
+  fetchDealLineItems,
+  formatTimelineForPrompt,
+  formatLineItemsForPrompt
 } from "./hubspot-data.js";
 import { callOpenAIForQA } from "./openai-qa.js";
 
@@ -71,16 +73,21 @@ async function postToResponseUrl(responseUrl, text, replaceOriginal = false) {
   }
 }
 
-function buildPromptFromHubSpotData({ dealName, hubspotDealUrl, ownerLine, created, closed, cycleDays, contactsLine, companyLine, timeline }) {
+function buildPromptFromHubSpotData({ dealName, hubspotDealUrl, ownerLine, created, closed, cycleDays, contactsLine, companyLine, amount, dealType, dealStage, pipelineName, description, lineItems, timeline }) {
   const instructions = `
 You are writing a deal handoff document for post-sales teams (Deployments, Customer Success, and Training) who are taking over from Sales. The audience has ZERO prior context on this deal — they need to understand who the customer is, what happened during the sales process, and what to watch out for.
 
-Using the HubSpot activity data below for deal "${dealName}", produce a structured handoff summary. Use Slack mrkdwn formatting.
+Using the HubSpot data below for deal "${dealName}", produce a structured handoff summary. Use Slack mrkdwn formatting.
+
+CRITICAL: Use the structured deal data (amount, deal type, products/line items, deal stage) as ground truth for what was sold, the deal structure, and financials. Do NOT infer these details from email or meeting content — emails may discuss multiple products, pricing options, or deal structures that were NOT part of the final deal.
 
 Output the following sections in this exact order. Use bold section headers (*Header*). If data for a section is not available, write "Not found in HubSpot records" under that header — do NOT skip the section.
 
 *Deal Overview*
 One concise line with: deal name, company, sales owner, key contacts (name + role), and deal cycle length (${cycleDays != null ? `${cycleDays} days` : "unknown"}). Include the deal link: ${hubspotDealUrl}
+
+*What Was Sold*
+State the products/line items, deal amount, and deal type. Use the Products/Line Items data below — this is the definitive record of what was sold. If line items are available, list them. Include the deal amount and deal type.
 
 *Sales Process Summary*
 2-4 sentences synthesizing how the deal progressed from first contact to close. What were the key milestones, meetings, or turning points? How did the deal close (e.g., demo-driven, referral, negotiation, quick sign)? Draw from emails, meetings, calls, and notes chronologically.
@@ -104,13 +111,19 @@ Rules:
 - Do not dump raw data or field names. Synthesize and summarize.
 - Do not repeat the same information across sections.
 
-HubSpot Data:
+HubSpot Deal Data:
 - Deal: ${dealName}
 - Sales Owner: ${ownerLine}
+- Amount: ${amount || "Not found in HubSpot records"}
+- Deal Type: ${dealType || "Not found in HubSpot records"}
+- Deal Stage: ${dealStage || "Not found in HubSpot records"}
+- Pipeline: ${pipelineName || "Not found in HubSpot records"}
 - Created: ${created || "Not found in HubSpot records"}
 - Closed: ${closed || "Not found in HubSpot records"}${cycleDays != null ? ` (${cycleDays}-day cycle)` : ""}
 - Company: ${companyLine || "Not found in HubSpot records"}
 - Contacts: ${contactsLine}
+${description ? `- Description: ${description}` : ""}
+${lineItems ? `- Products/Line Items:\n${lineItems}` : "- Products/Line Items: None found in HubSpot records"}
 
 Activity Timeline (most recent first):
 ${timeline || "No activity found in HubSpot."}
@@ -190,13 +203,14 @@ export default async function handler(req, res) {
           : `https://app.hubspot.com/deals/${dealId}`;
 
         // ── Phase 3: All data fetches in parallel ──
-        const [ownerName, associations, emails, calls, meetings, notes] = await Promise.all([
+        const [ownerName, associations, emails, calls, meetings, notes, lineItemsRaw] = await Promise.all([
           resolveOwnerName(hs, ownerId),
           getDealAssociations(hs, dealId),
           fetchDealEmails(hs, dealId),
           fetchDealCalls(hs, dealId),
           fetchDealMeetings(hs, dealId),
-          fetchDealNotes(hs, dealId)
+          fetchDealNotes(hs, dealId),
+          fetchDealLineItems(hs, dealId)
         ]);
 
         // Phase 3b: Contacts + companies (depends on associations)
@@ -235,6 +249,15 @@ export default async function handler(req, res) {
 
         // ── Phase 4: Build timeline + prompt + OpenAI ──
         const timeline = formatTimelineForPrompt(emails, calls, meetings, notes);
+        const lineItems = formatLineItemsForPrompt(lineItemsRaw);
+
+        const amount = deal.properties?.amount
+          ? `${deal.properties.deal_currency_code || "$"}${Number(deal.properties.amount).toLocaleString()}`
+          : null;
+        const dealType = deal.properties?.dealtype || null;
+        const dealStage = deal.properties?.dealstage || null;
+        const pipelineName = deal.properties?.pipeline || null;
+        const description = deal.properties?.description || null;
 
         const prompt = buildPromptFromHubSpotData({
           dealName,
@@ -245,6 +268,12 @@ export default async function handler(req, res) {
           cycleDays,
           contactsLine,
           companyLine,
+          amount,
+          dealType,
+          dealStage,
+          pipelineName,
+          description,
+          lineItems,
           timeline
         });
 

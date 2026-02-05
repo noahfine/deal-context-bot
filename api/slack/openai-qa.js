@@ -41,6 +41,12 @@ export function buildQAPrompt({ question, dealData, threadContext, hubspotData, 
     cycleDays,
     contactsLine,
     companyLine,
+    amount,
+    dealType,
+    dealStage,
+    pipelineName,
+    description,
+    lineItems,
     timeline
   } = hubspotData;
 
@@ -81,10 +87,16 @@ HubSpot Deal Information:
 - Deal name: ${dealName}
 - Deal link: ${hubspotDealUrl}
 - Sales owner: ${ownerLine}
+- Amount: ${amount || "Not found in HubSpot records"}
+- Deal Type: ${dealType || "Not found in HubSpot records"}
+- Deal Stage: ${dealStage || "Not found in HubSpot records"}
+- Pipeline: ${pipelineName || "Not found in HubSpot records"}
 - Created: ${created || "Not found in HubSpot records"}
 - Closed: ${closed || "Not found in HubSpot records"}${cycleDays != null ? ` (${cycleDays}-day cycle)` : ""}
 - Contacts: ${contactsLine || "Not found in HubSpot records"}
 - Companies: ${companyLine || "Not found in HubSpot records"}
+${description ? `- Description: ${description}` : ""}
+${lineItems ? `- Products/Line Items:\n${lineItems}` : ""}
 ${timeline ? `\nDeal Activity Timeline (most recent first):\n${timeline}` : ""}
 
 Slack Channel History (recent messages):
@@ -92,6 +104,7 @@ ${channelHistoryText}
 ${threadContextText}
 
 Rules:
+- CRITICAL: Use the structured deal data (amount, deal type, products/line items, deal stage) as ground truth. Do NOT infer product names, deal type, financial details, or deal structure from email or meeting content — emails may discuss multiple products or options that were not part of the final deal.
 - Answer directly and concisely. Use 1-3 sentences for simple questions, more for questions requiring detail.
 - Synthesize information from both Slack and HubSpot. Prefer Slack for recent/contextual info, HubSpot for historical deal data.
 - When asked about customer temperament, deal history, holdups, or risks, draw from the full activity timeline — not just the most recent entry.

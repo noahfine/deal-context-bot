@@ -114,6 +114,55 @@ export async function fetchDealNotes(hs, dealId) {
   }
 }
 
+export async function fetchDealLineItems(hs, dealId) {
+  try {
+    const assoc = await hs.get(`/crm/v4/objects/deals/${dealId}/associations/line_items`);
+    const lineItemIds = (assoc.data?.results || [])
+      .map((r) => r.toObjectId)
+      .filter(Boolean)
+      .slice(0, 50);
+
+    if (!lineItemIds.length) return [];
+
+    const items = await batchRead(hs, "line_items", lineItemIds, [
+      "name",
+      "description",
+      "quantity",
+      "price",
+      "amount",
+      "hs_product_id",
+      "hs_sku",
+      "recurringbillingfrequency",
+      "hs_term_in_months"
+    ]);
+    return items;
+  } catch (err) {
+    console.error("[fetchDealLineItems] error:", err.message, err.response?.status);
+    return [];
+  }
+}
+
+export function formatLineItemsForPrompt(lineItems) {
+  if (!lineItems || !lineItems.length) return null;
+  return lineItems
+    .map((item) => {
+      const p = item.properties || {};
+      const name = p.name || "Unnamed item";
+      const qty = p.quantity ? `Qty: ${p.quantity}` : "";
+      const price = p.price ? `$${Number(p.price).toLocaleString()}` : "";
+      const amount = p.amount ? `$${Number(p.amount).toLocaleString()}` : "";
+      const freq = p.recurringbillingfrequency || "";
+      const term = p.hs_term_in_months ? `${p.hs_term_in_months}mo term` : "";
+      const desc = p.description ? ` — ${p.description.substring(0, 100)}` : "";
+
+      let detail = [qty, price ? `@ ${price}` : "", amount ? `= ${amount}` : ""].filter(Boolean).join(" ");
+      if (freq) detail += ` (${freq})`;
+      if (term) detail += ` [${term}]`;
+      return `  - ${name}${detail ? ` (${detail})` : ""}${desc}`;
+    })
+    .join("\n");
+}
+
 // ===== Keyword-Based Data Requirements =====
 
 export function determineRequiredData(question, dealData) {
