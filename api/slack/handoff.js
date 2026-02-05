@@ -13,6 +13,13 @@ import {
   resolveOwnerName,
   daysBetweenISO
 } from "./utils.js";
+import {
+  fetchDealEmails,
+  fetchDealCalls,
+  fetchDealMeetings,
+  fetchDealNotes,
+  formatTimelineForPrompt
+} from "./hubspot-data.js";
 import { callOpenAIForQA } from "./openai-qa.js";
 
 function verifySlackRequest(req, rawBody) {
@@ -64,25 +71,49 @@ async function postToResponseUrl(responseUrl, text, replaceOriginal = false) {
   }
 }
 
-function buildPromptFromHubSpotData({ dealName, hubspotDealUrl, ownerLine, created, closed, cycleDays, contactsLine, notesSummary }) {
+function buildPromptFromHubSpotData({ dealName, hubspotDealUrl, ownerLine, created, closed, cycleDays, contactsLine, companyLine, timeline }) {
   const instructions = `
-You are generating a post-sales handoff summary for a project Slack channel. Be concise, factual, and write like a salesperson giving a short verbal handoff to Deployments and Customer Success.
+You are writing a deal handoff document for post-sales teams (Deployments, Customer Success, and Training) who are taking over from Sales. The audience has ZERO prior context on this deal — they need to understand who the customer is, what happened during the sales process, and what to watch out for.
 
-Using the HubSpot data below for deal "${dealName}", produce exactly 3–5 bullets that cover the KEY deployment/CSM points. Use Slack mrkdwn or plain text bullets only.
+Using the HubSpot activity data below for deal "${dealName}", produce a structured handoff summary. Use Slack mrkdwn formatting.
+
+Output the following sections in this exact order. Use bold section headers (*Header*). If data for a section is not available, write "Not found in HubSpot records" under that header — do NOT skip the section.
+
+*Deal Overview*
+One concise line with: deal name, company, sales owner, key contacts (name + role), and deal cycle length (${cycleDays != null ? `${cycleDays} days` : "unknown"}). Include the deal link: ${hubspotDealUrl}
+
+*Sales Process Summary*
+2-4 sentences synthesizing how the deal progressed from first contact to close. What were the key milestones, meetings, or turning points? How did the deal close (e.g., demo-driven, referral, negotiation, quick sign)? Draw from emails, meetings, calls, and notes chronologically.
+
+*Customer Temperament*
+1-2 sentences on what the customer is like to work with, inferred from communication patterns. Are they responsive or slow? Detail-oriented or hands-off? Friendly, demanding, or neutral? If unclear from the data, say so rather than guessing.
+
+*Current Status & Most Recent Activity*
+What is the latest activity on this deal? What was the most recent conversation about? 1-3 sentences covering where things stand right now.
+
+*Open Items, Holdups & Risks*
+Bullet any unresolved items, blockers, concerns, or risks mentioned anywhere in the activity history. If nothing is flagged, write "None identified in HubSpot records."
+
+*Key Technical Details*
+Bullet any technical requirements, product specifics, integration needs, or configuration details mentioned. If none, write "None mentioned in HubSpot records."
 
 Rules:
-- Return exactly 3 to 5 bullet lines only. Each bullet must be 1–2 sentences. No raw JSON or field dumps.
-- Do not invent facts. If something is not present or clear, write: Not observed in HubSpot history.
+- Be concise but do not omit important details. Aim for completeness over brevity.
+- Every claim must come from the data below. Do not invent or assume facts.
+- Write in plain language as if briefing a colleague verbally.
+- Do not dump raw data or field names. Synthesize and summarize.
+- Do not repeat the same information across sections.
 
-HubSpot data:
+HubSpot Data:
 - Deal: ${dealName}
-- Deal link: ${hubspotDealUrl}
-- Sales owner: ${ownerLine}
-- Created/Closed: ${created || "Not observed in HubSpot history"} / ${closed || "Not observed in HubSpot history"}${
-    cycleDays != null ? ` — ${cycleDays} days` : ""
-  }
+- Sales Owner: ${ownerLine}
+- Created: ${created || "Not found in HubSpot records"}
+- Closed: ${closed || "Not found in HubSpot records"}${cycleDays != null ? ` (${cycleDays}-day cycle)` : ""}
+- Company: ${companyLine || "Not found in HubSpot records"}
 - Contacts: ${contactsLine}
-- Notes / recent activity summary: ${notesSummary}
+
+Activity Timeline (most recent first):
+${timeline || "No activity found in HubSpot."}
 `.trim();
 
   return instructions;
@@ -130,12 +161,16 @@ export default async function handler(req, res) {
   waitUntil(
     (async () => {
       try {
-        const channelName = await getSlackChannelName(channel_id);
-        const dealQuery = channelNameToDealQuery(channelName);
+        // ── Phase 1: Channel name + HubSpot token (parallel) ──
+        const [channelName, accessToken] = await Promise.all([
+          getSlackChannelName(channel_id),
+          getHubSpotAccessToken()
+        ]);
 
-        const accessToken = await getHubSpotAccessToken();
+        const dealQuery = channelNameToDealQuery(channelName);
         const hs = hubspotClient(accessToken);
 
+        // ── Phase 2: Find deal ──
         const deal = await findBestDeal(hs, dealQuery);
         if (!deal) {
           await postToResponseUrl(response_url, `No HubSpot deal found matching "${dealQuery}".`, true);
@@ -147,28 +182,48 @@ export default async function handler(req, res) {
         const created = deal.properties?.createdate || null;
         const closed = deal.properties?.closedate || null;
         const cycleDays = daysBetweenISO(created, closed);
-
         const ownerId = deal.properties?.hubspot_owner_id || null;
-        const ownerName = await resolveOwnerName(hs, ownerId);
-        const ownerLine = ownerName ? `${ownerName} (Sales)` : (ownerId ? `${ownerId} (name not found in HubSpot)` : "Not observed in HubSpot history");
 
-        const { contactIds, companyIds } = await getDealAssociations(hs, dealId);
+        const portalId = process.env.HUBSPOT_PORTAL_ID;
+        const hubspotDealUrl = portalId
+          ? `https://app.hubspot.com/contacts/${portalId}/deal/${dealId}`
+          : `https://app.hubspot.com/deals/${dealId}`;
 
-        const contacts = await batchRead(hs, "contacts", contactIds, ["firstname", "lastname", "jobtitle", "email"]);
-        const companies = await batchRead(hs, "companies", companyIds, ["name", "domain"]);
+        // ── Phase 3: All data fetches in parallel ──
+        const [ownerName, associations, emails, calls, meetings, notes] = await Promise.all([
+          resolveOwnerName(hs, ownerId),
+          getDealAssociations(hs, dealId),
+          fetchDealEmails(hs, dealId),
+          fetchDealCalls(hs, dealId),
+          fetchDealMeetings(hs, dealId),
+          fetchDealNotes(hs, dealId)
+        ]);
+
+        // Phase 3b: Contacts + companies (depends on associations)
+        const { contactIds, companyIds } = associations;
+        const [contacts, companies] = await Promise.all([
+          batchRead(hs, "contacts", contactIds, ["firstname", "lastname", "jobtitle", "email"]),
+          batchRead(hs, "companies", companyIds, ["name", "domain"])
+        ]);
+
+        const ownerLine = ownerName
+          ? `${ownerName} (Sales)`
+          : ownerId
+            ? `${ownerId} (name not found in HubSpot)`
+            : "Not found in HubSpot records";
 
         const contactsLine = contacts.length
           ? contacts
               .slice(0, 6)
               .map((c) => {
                 const p = c.properties || {};
-                const nm = [p.firstname, p.lastname].filter(Boolean).join(" ").trim() || "Name not observed";
+                const nm = [p.firstname, p.lastname].filter(Boolean).join(" ").trim() || "Name not found";
                 const role = p.jobtitle ? `, ${p.jobtitle}` : "";
                 const email = p.email ? ` (${p.email})` : "";
                 return `${nm}${role}${email}`;
               })
               .join("; ")
-          : "Not observed in HubSpot history";
+          : "Not found in HubSpot records";
 
         const companyLine = companies.length
           ? companies
@@ -176,32 +231,11 @@ export default async function handler(req, res) {
               .map((c) => c.properties?.name)
               .filter(Boolean)
               .join("; ")
-          : "Not observed in HubSpot history";
+          : "Not found in HubSpot records";
 
-        let notesSummary = "Not observed in HubSpot history";
-        try {
-          const assoc = await hs.get(`/crm/v4/objects/deals/${dealId}/associations/notes`);
-          const noteIds = (assoc.data?.results || []).map((r) => r.toObjectId).filter(Boolean).slice(0, 10);
+        // ── Phase 4: Build timeline + prompt + OpenAI ──
+        const timeline = formatTimelineForPrompt(emails, calls, meetings, notes);
 
-          if (noteIds.length) {
-            const notes = await batchRead(hs, "notes", noteIds, ["hs_note_body", "hs_createdate"]);
-            const snippets = notes
-              .sort((a, b) => Number(new Date(b.properties?.hs_createdate || 0)) - Number(new Date(a.properties?.hs_createdate || 0)))
-              .slice(0, 10)
-              .map((n) => (n.properties?.hs_note_body || "").replace(/\s+/g, " ").trim())
-              .filter(Boolean)
-              .slice(0, 6);
-
-            if (snippets.length) notesSummary = snippets.join(" | ").slice(0, 1200);
-          }
-        } catch (e) {
-          // leave default
-        }
-
-        const portalId = process.env.HUBSPOT_PORTAL_ID;
-        const hubspotDealUrl = portalId
-          ? `https://app.hubspot.com/contacts/${portalId}/deal/${dealId}`
-          : `https://app.hubspot.com/deals/${dealId}`;
         const prompt = buildPromptFromHubSpotData({
           dealName,
           hubspotDealUrl,
@@ -210,7 +244,8 @@ export default async function handler(req, res) {
           closed,
           cycleDays,
           contactsLine,
-          notesSummary: `${notesSummary}${companyLine !== "Not observed in HubSpot history" ? ` (Company: ${companyLine})` : ""}`
+          companyLine,
+          timeline
         });
 
         const summaryText = await callOpenAIForQA(prompt);

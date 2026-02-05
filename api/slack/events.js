@@ -260,10 +260,7 @@ async function handleAppMention(event) {
       : "Not observed in HubSpot history";
 
     // Build unified timeline from all activity types
-    console.log("[handleAppMention] data counts: emails=%d calls=%d meetings=%d notes=%d",
-      r.emails?.length || 0, r.calls?.length || 0, r.meetings?.length || 0, r.notes?.length || 0);
     const timeline = formatTimelineForPrompt(r.emails, r.calls, r.meetings, r.notes);
-    console.log("[handleAppMention] timeline preview: %s", timeline?.slice(0, 300));
 
     // ── Phase 4: OpenAI + post to Slack ──
     const prompt = buildQAPrompt({

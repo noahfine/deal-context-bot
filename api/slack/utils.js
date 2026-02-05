@@ -430,7 +430,7 @@ export async function getDealAssociations(hs, dealId) {
 export async function batchRead(hs, objectType, ids, properties) {
   if (!ids.length) return [];
   const resp = await hs.post(`/crm/v3/objects/${objectType}/batch/read`, {
-    inputs: ids.slice(0, 50).map((id) => ({ id })),
+    inputs: ids.slice(0, 100).map((id) => ({ id })),
     properties
   });
   return resp.data?.results || [];

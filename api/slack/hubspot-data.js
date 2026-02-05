@@ -6,16 +6,13 @@ import { batchRead } from "./utils.js";
 
 export async function fetchDealEmails(hs, dealId) {
   try {
-    console.log("[fetchDealEmails] fetching associations for deal %s...", dealId);
     const assoc = await hs.get(`/crm/v4/objects/deals/${dealId}/associations/emails`);
-    console.log("[fetchDealEmails] assoc response status=%s results=%s", assoc.status, JSON.stringify(assoc.data?.results?.length ?? "no results key"));
-
     const emailIds = (assoc.data?.results || [])
       .map((r) => r.toObjectId)
       .filter(Boolean)
-      .slice(0, 20);
+      .sort((a, b) => Number(b) - Number(a))
+      .slice(0, 100);
 
-    console.log("[fetchDealEmails] found %d email IDs: %s", emailIds.length, emailIds.slice(0, 5).join(", "));
     if (!emailIds.length) return [];
 
     const emails = await batchRead(hs, "emails", emailIds, [
@@ -28,33 +25,26 @@ export async function fetchDealEmails(hs, dealId) {
       "hs_email_sender_email",
       "hs_email_to_email"
     ]);
-    console.log("[fetchDealEmails] batch read returned %d emails", emails.length);
-    if (emails.length) {
-      const first = emails[0]?.properties;
-      console.log("[fetchDealEmails] most recent: subject=%s ts=%s", first?.hs_email_subject, first?.hs_timestamp);
-    }
     return emails.sort(
       (a, b) =>
         Number(new Date(b.properties?.hs_timestamp || 0)) -
         Number(new Date(a.properties?.hs_timestamp || 0))
     );
   } catch (err) {
-    console.error("[fetchDealEmails] ERROR: %s (status=%s, data=%s)", err.message, err.response?.status, JSON.stringify(err.response?.data)?.slice(0, 500));
+    console.error("[fetchDealEmails] error:", err.message, err.response?.status);
     return [];
   }
 }
 
 export async function fetchDealCalls(hs, dealId) {
   try {
-    console.log("[fetchDealCalls] fetching associations for deal %s...", dealId);
     const assoc = await hs.get(`/crm/v4/objects/deals/${dealId}/associations/calls`);
-    console.log("[fetchDealCalls] assoc response status=%s results=%s", assoc.status, assoc.data?.results?.length ?? "no results key");
     const callIds = (assoc.data?.results || [])
       .map((r) => r.toObjectId)
       .filter(Boolean)
-      .slice(0, 20);
+      .sort((a, b) => Number(b) - Number(a))
+      .slice(0, 100);
 
-    console.log("[fetchDealCalls] found %d call IDs", callIds.length);
     if (!callIds.length) return [];
 
     const calls = await batchRead(hs, "calls", callIds, [
@@ -66,29 +56,26 @@ export async function fetchDealCalls(hs, dealId) {
       "hs_call_status",
       "hs_timestamp"
     ]);
-    console.log("[fetchDealCalls] batch read returned %d calls", calls.length);
     return calls.sort(
       (a, b) =>
         Number(new Date(b.properties?.hs_timestamp || 0)) -
         Number(new Date(a.properties?.hs_timestamp || 0))
     );
   } catch (err) {
-    console.error("[fetchDealCalls] ERROR: %s (status=%s, data=%s)", err.message, err.response?.status, JSON.stringify(err.response?.data)?.slice(0, 500));
+    console.error("[fetchDealCalls] error:", err.message, err.response?.status);
     return [];
   }
 }
 
 export async function fetchDealMeetings(hs, dealId) {
   try {
-    console.log("[fetchDealMeetings] fetching associations for deal %s...", dealId);
     const assoc = await hs.get(`/crm/v4/objects/deals/${dealId}/associations/meetings`);
-    console.log("[fetchDealMeetings] assoc response status=%s results=%s", assoc.status, assoc.data?.results?.length ?? "no results key");
     const meetingIds = (assoc.data?.results || [])
       .map((r) => r.toObjectId)
       .filter(Boolean)
-      .slice(0, 20);
+      .sort((a, b) => Number(b) - Number(a))
+      .slice(0, 100);
 
-    console.log("[fetchDealMeetings] found %d meeting IDs", meetingIds.length);
     if (!meetingIds.length) return [];
 
     const meetings = await batchRead(hs, "meetings", meetingIds, [
@@ -99,14 +86,13 @@ export async function fetchDealMeetings(hs, dealId) {
       "hs_meeting_outcome",
       "hs_timestamp"
     ]);
-    console.log("[fetchDealMeetings] batch read returned %d meetings", meetings.length);
     return meetings.sort(
       (a, b) =>
         Number(new Date(b.properties?.hs_timestamp || 0)) -
         Number(new Date(a.properties?.hs_timestamp || 0))
     );
   } catch (err) {
-    console.error("[fetchDealMeetings] ERROR: %s (status=%s, data=%s)", err.message, err.response?.status, JSON.stringify(err.response?.data)?.slice(0, 500));
+    console.error("[fetchDealMeetings] error:", err.message, err.response?.status);
     return [];
   }
 }
@@ -114,7 +100,7 @@ export async function fetchDealMeetings(hs, dealId) {
 export async function fetchDealNotes(hs, dealId) {
   try {
     const assoc = await hs.get(`/crm/v4/objects/deals/${dealId}/associations/notes`);
-    const noteIds = (assoc.data?.results || []).map((r) => r.toObjectId).filter(Boolean).slice(0, 20);
+    const noteIds = (assoc.data?.results || []).map((r) => r.toObjectId).filter(Boolean).sort((a, b) => Number(b) - Number(a)).slice(0, 100);
 
     if (!noteIds.length) return [];
 
@@ -261,5 +247,5 @@ export function formatTimelineForPrompt(emails, calls, meetings, notes) {
     (a, b) => Number(new Date(b.timestamp)) - Number(new Date(a.timestamp))
   );
 
-  return items.slice(0, 25).map((i) => i.line).join("\n");
+  return items.slice(0, 40).map((i) => i.line).join("\n");
 }
