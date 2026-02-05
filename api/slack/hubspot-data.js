@@ -1,32 +1,95 @@
-import axios from "axios";
 import { batchRead } from "./utils.js";
 
-const HUBSPOT_TIMEOUT_MS = 10000;
+// ===== Modern CRM v4 Deal Activity Fetching =====
+// Uses associations API (v4) + batch read (v3) — same proven pattern as fetchDealNotes.
+// Replaces deprecated /engagements/v1/ and non-functional /integrations/v1/ endpoints.
 
-// ===== On-Demand HubSpot Data Fetching =====
-
-export async function fetchDealEngagements(hs, dealId) {
+export async function fetchDealEmails(hs, dealId) {
   try {
-    // Fetch engagements associated with the deal
-    const resp = await hs.get(`/engagements/v1/engagements/associated/deal/${dealId}/paged`, {
-      params: { limit: 50 }
-    });
-    return resp.data?.results || [];
+    const assoc = await hs.get(`/crm/v4/objects/deals/${dealId}/associations/emails`);
+    const emailIds = (assoc.data?.results || [])
+      .map((r) => r.toObjectId)
+      .filter(Boolean)
+      .slice(0, 20);
+
+    if (!emailIds.length) return [];
+
+    const emails = await batchRead(hs, "emails", emailIds, [
+      "hs_email_subject",
+      "hs_email_direction",
+      "hs_email_status",
+      "hs_email_text",
+      "hs_email_html",
+      "hs_timestamp",
+      "hs_email_sender_email",
+      "hs_email_to_email"
+    ]);
+    return emails.sort(
+      (a, b) =>
+        Number(new Date(b.properties?.hs_timestamp || 0)) -
+        Number(new Date(a.properties?.hs_timestamp || 0))
+    );
   } catch (err) {
-    console.error("Error fetching engagements:", err.message);
+    console.error("Error fetching emails:", err.message);
     return [];
   }
 }
 
-export async function fetchDealActivities(hs, dealId) {
+export async function fetchDealCalls(hs, dealId) {
   try {
-    // Fetch timeline activities for the deal
-    const resp = await hs.get(`/integrations/v1/${dealId}/timeline/events`, {
-      params: { limit: 50 }
-    });
-    return resp.data || [];
+    const assoc = await hs.get(`/crm/v4/objects/deals/${dealId}/associations/calls`);
+    const callIds = (assoc.data?.results || [])
+      .map((r) => r.toObjectId)
+      .filter(Boolean)
+      .slice(0, 20);
+
+    if (!callIds.length) return [];
+
+    const calls = await batchRead(hs, "calls", callIds, [
+      "hs_call_title",
+      "hs_call_body",
+      "hs_call_direction",
+      "hs_call_duration",
+      "hs_call_disposition",
+      "hs_call_status",
+      "hs_timestamp"
+    ]);
+    return calls.sort(
+      (a, b) =>
+        Number(new Date(b.properties?.hs_timestamp || 0)) -
+        Number(new Date(a.properties?.hs_timestamp || 0))
+    );
   } catch (err) {
-    console.error("Error fetching activities:", err.message);
+    console.error("Error fetching calls:", err.message);
+    return [];
+  }
+}
+
+export async function fetchDealMeetings(hs, dealId) {
+  try {
+    const assoc = await hs.get(`/crm/v4/objects/deals/${dealId}/associations/meetings`);
+    const meetingIds = (assoc.data?.results || [])
+      .map((r) => r.toObjectId)
+      .filter(Boolean)
+      .slice(0, 20);
+
+    if (!meetingIds.length) return [];
+
+    const meetings = await batchRead(hs, "meetings", meetingIds, [
+      "hs_meeting_title",
+      "hs_meeting_body",
+      "hs_meeting_start_time",
+      "hs_meeting_end_time",
+      "hs_meeting_outcome",
+      "hs_timestamp"
+    ]);
+    return meetings.sort(
+      (a, b) =>
+        Number(new Date(b.properties?.hs_timestamp || 0)) -
+        Number(new Date(a.properties?.hs_timestamp || 0))
+    );
+  } catch (err) {
+    console.error("Error fetching meetings:", err.message);
     return [];
   }
 }
@@ -48,88 +111,138 @@ export async function fetchDealNotes(hs, dealId) {
   }
 }
 
+// ===== Keyword-Based Data Requirements =====
 
 export function determineRequiredData(question, dealData) {
   const q = question.toLowerCase();
   const required = {
-    engagements: false,
-    activities: false,
-    notes: false,
-    contacts: true, // Always fetch contacts
-    companies: true // Always fetch companies
+    emails: true,     // Always fetch — most commonly asked about
+    notes: true,      // Always fetch — most commonly asked about
+    calls: false,
+    meetings: false,
+    contacts: true,
+    companies: true
   };
 
-  // Check for keywords that indicate what data to fetch
-  if (
-    q.includes("contact") ||
-    q.includes("email") ||
-    q.includes("emailed") ||
+  // Broad triggers for calls and meetings
+  const activityTriggers =
     q.includes("call") ||
     q.includes("called") ||
-    q.includes("meeting") ||
+    q.includes("phone") ||
+    q.includes("spoke") ||
+    q.includes("spoken") ||
+    q.includes("conversation") ||
     q.includes("meet") ||
-    q.includes("last person") ||
-    q.includes("who") ||
-    q.includes("communicat")
-  ) {
-    required.engagements = true;
-  }
+    q.includes("meeting") ||
+    q.includes("demo") ||
+    q.includes("schedule") ||
+    q.includes("calendar") ||
+    q.includes("activity") ||
+    q.includes("timeline") ||
+    q.includes("history") ||
+    q.includes("recent") ||
+    q.includes("latest") ||
+    q.includes("update") ||
+    q.includes("status") ||
+    q.includes("happen") ||
+    q.includes("touch") ||
+    q.includes("communicat") ||
+    q.includes("engag") ||
+    q.includes("interact") ||
+    q.includes("outreach") ||
+    q.includes("last") ||
+    q.includes("summary") ||
+    q.includes("overview") ||
+    q.includes("what's going on") ||
+    q.includes("whats going on");
 
-  if (q.includes("activity") || q.includes("timeline") || q.includes("history") || q.includes("recent")) {
-    required.activities = true;
-  }
-
-  if (q.includes("note") || q.includes("comment") || q.includes("remark")) {
-    required.notes = true;
+  if (activityTriggers) {
+    required.calls = true;
+    required.meetings = true;
   }
 
   return required;
 }
 
-export function formatEngagementsForPrompt(engagements) {
-  if (!engagements.length) return "No engagements found in HubSpot.";
+// ===== Unified Timeline Formatter =====
 
-  const formatted = engagements
-    .slice(0, 20)
-    .map((eng) => {
-      const type = eng.engagement?.type || "unknown";
-      const createdAt = eng.engagement?.createdAt ? new Date(eng.engagement.createdAt).toISOString().split("T")[0] : "unknown date";
-      const metadata = eng.engagement?.metadata || {};
-      let details = "";
-
-      if (type === "EMAIL") {
-        details = `Subject: ${metadata.subject || "No subject"}`;
-      } else if (type === "CALL") {
-        details = `Duration: ${metadata.duration || "unknown"}`;
-      } else if (type === "MEETING") {
-        details = `Title: ${metadata.title || "No title"}`;
-      } else if (type === "NOTE") {
-        details = `Body: ${(metadata.body || "").substring(0, 200)}`;
-      }
-
-      return `- ${type} on ${createdAt}${details ? ` - ${details}` : ""}`;
-    })
-    .join("\n");
-
-  return formatted;
+function stripHtml(html) {
+  if (!html) return "";
+  return html.replace(/<[^>]*>/g, "").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
 }
 
-export function formatActivitiesForPrompt(activities) {
-  if (!activities || !activities.length) return "No activities found in HubSpot.";
-  return JSON.stringify(activities.slice(0, 20), null, 2);
-}
+export function formatTimelineForPrompt(emails, calls, meetings, notes) {
+  const items = [];
 
-export function formatNotesForPrompt(notes) {
-  if (!notes.length) return "No notes found in HubSpot.";
+  for (const e of (emails || [])) {
+    const p = e.properties || {};
+    const date = p.hs_timestamp
+      ? new Date(p.hs_timestamp).toISOString().split("T")[0]
+      : "unknown date";
+    const direction = p.hs_email_direction === "INCOMING_EMAIL" ? "Received" : "Sent";
+    const subject = p.hs_email_subject || "No subject";
+    const from = p.hs_email_sender_email || "";
+    const to = p.hs_email_to_email || "";
+    const body = (p.hs_email_text || stripHtml(p.hs_email_html) || "").replace(/\s+/g, " ").trim();
+    const snippet = body ? `: ${body.substring(0, 200)}` : "";
+    items.push({
+      timestamp: p.hs_timestamp || "0",
+      line: `- EMAIL (${direction}) on ${date} — Subject: "${subject}"${from ? ` from ${from}` : ""}${to ? ` to ${to}` : ""}${snippet}`
+    });
+  }
 
-  return notes
-    .slice(0, 10)
-    .map((n) => {
-      const body = (n.properties?.hs_note_body || "").replace(/\s+/g, " ").trim();
-      const date = n.properties?.hs_createdate
-        ? new Date(n.properties.hs_createdate).toISOString().split("T")[0]
-        : "unknown date";
-      return `- ${date}: ${body.substring(0, 300)}`;
-    })
-    .join("\n");
+  for (const c of (calls || [])) {
+    const p = c.properties || {};
+    const date = p.hs_timestamp
+      ? new Date(p.hs_timestamp).toISOString().split("T")[0]
+      : "unknown date";
+    const title = p.hs_call_title || "Call";
+    const direction = p.hs_call_direction === "INBOUND" ? "Inbound" : "Outbound";
+    const duration = p.hs_call_duration
+      ? `${Math.round(Number(p.hs_call_duration) / 1000 / 60)}min`
+      : "";
+    const disposition = p.hs_call_disposition || "";
+    const body = (p.hs_call_body || "").replace(/\s+/g, " ").trim();
+    const snippet = body ? `: ${body.substring(0, 200)}` : "";
+    items.push({
+      timestamp: p.hs_timestamp || "0",
+      line: `- CALL (${direction}) on ${date} — ${title}${duration ? `, ${duration}` : ""}${disposition ? ` [${disposition}]` : ""}${snippet}`
+    });
+  }
+
+  for (const m of (meetings || [])) {
+    const p = m.properties || {};
+    const date = p.hs_timestamp
+      ? new Date(p.hs_timestamp).toISOString().split("T")[0]
+      : "unknown date";
+    const title = p.hs_meeting_title || "Meeting";
+    const outcome = p.hs_meeting_outcome || "";
+    const body = (p.hs_meeting_body || "").replace(/\s+/g, " ").trim();
+    const snippet = body ? `: ${stripHtml(body).substring(0, 200)}` : "";
+    items.push({
+      timestamp: p.hs_timestamp || "0",
+      line: `- MEETING on ${date} — ${title}${outcome ? ` [${outcome}]` : ""}${snippet}`
+    });
+  }
+
+  for (const n of (notes || [])) {
+    const p = n.properties || {};
+    const date = p.hs_createdate
+      ? new Date(p.hs_createdate).toISOString().split("T")[0]
+      : "unknown date";
+    const body = stripHtml(p.hs_note_body || "").replace(/\s+/g, " ").trim();
+    items.push({
+      timestamp: p.hs_createdate || "0",
+      line: `- NOTE on ${date}: ${body.substring(0, 300)}`
+    });
+  }
+
+  if (!items.length) return "No activity found in HubSpot.";
+
+  // Sort descending by timestamp (most recent first)
+  items.sort(
+    (a, b) => Number(new Date(b.timestamp)) - Number(new Date(a.timestamp))
+  );
+
+  return items.slice(0, 25).map((i) => i.line).join("\n");
 }

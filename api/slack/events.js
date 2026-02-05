@@ -25,12 +25,11 @@ import {
 } from "./utils.js";
 import {
   determineRequiredData,
-  fetchDealEngagements,
-  fetchDealActivities,
+  fetchDealEmails,
+  fetchDealCalls,
+  fetchDealMeetings,
   fetchDealNotes,
-  formatEngagementsForPrompt,
-  formatActivitiesForPrompt,
-  formatNotesForPrompt
+  formatTimelineForPrompt
 } from "./hubspot-data.js";
 import { buildQAPrompt, callOpenAIForQA } from "./openai-qa.js";
 
@@ -135,9 +134,13 @@ async function handleAppMention(event) {
   console.log("[handleAppMention] channel=%s thread_ts=%s text=%s", channel_id, thread_ts || "(none)", text?.slice(0, 80));
 
   try {
-    // Get bot user ID
-    const botUserId = await getBotUserId();
-    console.log("[handleAppMention] got bot user id, fetching channel info and deal...");
+    // ── Phase 1: Independent setup calls (parallel) ──
+    console.log("[handleAppMention] phase 1: bot ID + channel info + HubSpot token...");
+    const [botUserId, channelInfo, accessToken] = await Promise.all([
+      getBotUserId(),
+      getSlackChannelInfo(channel_id),
+      getHubSpotAccessToken()
+    ]);
 
     // Extract question from mention
     const question = extractQuestionFromMention(text, botUserId);
@@ -146,21 +149,34 @@ async function handleAppMention(event) {
       return;
     }
 
-    // Get channel info and check if public
-    console.log("[handleAppMention] fetching channel info...");
-    const channelInfo = await getSlackChannelInfo(channel_id);
     const isPublic = isPublicChannel(channelInfo);
     const channelName = channelInfo?.name || await getSlackChannelName(channel_id);
-
-    // Get deal from channel name
     const dealQuery = channelNameToDealQuery(channelName);
-    const accessToken = await getHubSpotAccessToken();
     const hs = hubspotClient(accessToken);
 
-    const deal = await findBestDeal(hs, dealQuery);
+    // ── Phase 2: Find deal + fetch channel history (parallel) ──
+    console.log("[handleAppMention] phase 2: find deal + channel history...");
+    const phase2 = [findBestDeal(hs, dealQuery)];
+    if (isPublic) {
+      phase2.push(
+        getChannelHistory(channel_id, 100).catch((err) => {
+          console.error("Error fetching channel history:", err.message);
+          return null;
+        })
+      );
+    }
+    const [deal, rawChannelHistory] = await Promise.all(phase2);
+
     if (!deal) {
       await slackPost(channel_id, `No HubSpot deal found matching "${dealQuery}".`);
       return;
+    }
+
+    let channelHistory = null;
+    if (rawChannelHistory) {
+      channelHistory = rawChannelHistory.filter(
+        (msg) => !isBotMessage(msg) && !msg.subtype && msg.text
+      );
     }
 
     const dealId = deal.id;
@@ -168,37 +184,59 @@ async function handleAppMention(event) {
     const created = deal.properties?.createdate || null;
     const closed = deal.properties?.closedate || null;
     const cycleDays = daysBetweenISO(created, closed);
-
     const ownerId = deal.properties?.hubspot_owner_id || null;
-    const ownerName = await resolveOwnerName(hs, ownerId);
+
+    const portalId = process.env.HUBSPOT_PORTAL_ID;
+    const hubspotDealUrl = portalId
+      ? `https://app.hubspot.com/contacts/${portalId}/deal/${dealId}`
+      : `https://app.hubspot.com/deals/${dealId}`;
+
+    // Determine what HubSpot data to fetch based on question
+    const requiredData = determineRequiredData(question, deal);
+
+    // ── Phase 3: All data fetches in parallel ──
+    console.log("[handleAppMention] phase 3: fetching deal data in parallel...");
+    const phase3 = {
+      owner: resolveOwnerName(hs, ownerId),
+      associations: getDealAssociations(hs, dealId),
+      emails: requiredData.emails ? fetchDealEmails(hs, dealId) : Promise.resolve([]),
+      notes: requiredData.notes ? fetchDealNotes(hs, dealId) : Promise.resolve([]),
+      calls: requiredData.calls ? fetchDealCalls(hs, dealId) : Promise.resolve([]),
+      meetings: requiredData.meetings ? fetchDealMeetings(hs, dealId) : Promise.resolve([]),
+      threadContext: thread_ts
+        ? getThreadContext(channel_id, thread_ts).then(async (cached) => {
+            if (cached) return cached;
+            try {
+              const msgs = await getThreadHistory(channel_id, thread_ts);
+              return msgs?.length ? { messages: msgs } : null;
+            } catch (err) {
+              console.error("[handleAppMention] error fetching thread history:", err.message);
+              return null;
+            }
+          })
+        : Promise.resolve(null)
+    };
+
+    const results = await Promise.all(
+      Object.values(phase3)
+    );
+    const keys = Object.keys(phase3);
+    const r = {};
+    keys.forEach((k, i) => { r[k] = results[i]; });
+
+    // Resolve contacts + companies from associations (fast batch reads)
+    const { contactIds, companyIds } = r.associations;
+    const [contacts, companies] = await Promise.all([
+      batchRead(hs, "contacts", contactIds, ["firstname", "lastname", "jobtitle", "email"]),
+      batchRead(hs, "companies", companyIds, ["name", "domain"])
+    ]);
+
+    const ownerName = r.owner;
     const ownerLine = ownerName
       ? `${ownerName} (Sales)`
       : ownerId
         ? `${ownerId} (name not found in HubSpot)`
         : "Not observed in HubSpot history";
-
-    // Fetch channel history if public channel
-    let channelHistory = null;
-    if (isPublic) {
-      try {
-        channelHistory = await getChannelHistory(channel_id, 100);
-        // Filter out bot messages and system messages
-        channelHistory = channelHistory.filter(
-          (msg) => !isBotMessage(msg) && !msg.subtype && msg.text
-        );
-      } catch (err) {
-        console.error("Error fetching channel history:", err.message);
-        // Continue without channel history
-      }
-    }
-
-    // Determine what HubSpot data to fetch based on question
-    const requiredData = determineRequiredData(question, deal);
-
-    // Fetch basic deal data
-    const { contactIds, companyIds } = await getDealAssociations(hs, dealId);
-    const contacts = await batchRead(hs, "contacts", contactIds, ["firstname", "lastname", "jobtitle", "email"]);
-    const companies = await batchRead(hs, "companies", companyIds, ["name", "domain"]);
 
     const contactsLine = contacts.length
       ? contacts
@@ -221,53 +259,14 @@ async function handleAppMention(event) {
           .join("; ")
       : "Not observed in HubSpot history";
 
-    // Fetch additional data on-demand
-    let engagements = null;
-    let activities = null;
-    let notes = null;
+    // Build unified timeline from all activity types
+    const timeline = formatTimelineForPrompt(r.emails, r.calls, r.meetings, r.notes);
 
-    if (requiredData.engagements) {
-      engagements = await fetchDealEngagements(hs, dealId);
-      engagements = formatEngagementsForPrompt(engagements);
-    }
-
-    if (requiredData.activities) {
-      activities = await fetchDealActivities(hs, dealId);
-      activities = formatActivitiesForPrompt(activities);
-    }
-
-    if (requiredData.notes) {
-      notes = await fetchDealNotes(hs, dealId);
-      notes = formatNotesForPrompt(notes);
-    }
-
-    const portalId = process.env.HUBSPOT_PORTAL_ID;
-    const hubspotDealUrl = portalId
-      ? `https://app.hubspot.com/contacts/${portalId}/deal/${dealId}`
-      : `https://app.hubspot.com/deals/${dealId}`;
-
-    // Load thread context if this @mention is inside an existing thread
-    let threadContext = null;
-    if (thread_ts) {
-      threadContext = await getThreadContext(channel_id, thread_ts);
-      if (!threadContext) {
-        // No cached context — fetch thread history from Slack
-        try {
-          const threadMessages = await getThreadHistory(channel_id, thread_ts);
-          if (threadMessages && threadMessages.length > 0) {
-            threadContext = { messages: threadMessages };
-          }
-        } catch (err) {
-          console.error("[handleAppMention] error fetching thread history:", err.message);
-        }
-      }
-    }
-
-    // Build Q&A prompt
+    // ── Phase 4: OpenAI + post to Slack ──
     const prompt = buildQAPrompt({
       question,
       dealData: { dealId, dealName },
-      threadContext,
+      threadContext: r.threadContext,
       hubspotData: {
         dealName,
         hubspotDealUrl,
@@ -277,18 +276,14 @@ async function handleAppMention(event) {
         cycleDays,
         contactsLine,
         companyLine,
-        engagements,
-        activities,
-        notes
+        timeline
       },
       channelHistory
     });
 
-    // Get answer from OpenAI
-    console.log("[handleAppMention] calling OpenAI...");
+    console.log("[handleAppMention] phase 4: calling OpenAI...");
     const answer = await callOpenAIForQA(prompt);
     console.log("[handleAppMention] posting to Slack thread_ts=%s", thread_ts || "(channel)");
-    // Post response in thread if mention was in a thread, otherwise in channel
     const response = await slackPost(channel_id, answer, thread_ts);
 
     // Store thread context if we have a thread (mention was in thread or we created one)

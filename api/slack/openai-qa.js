@@ -41,9 +41,7 @@ export function buildQAPrompt({ question, dealData, threadContext, hubspotData, 
     cycleDays,
     contactsLine,
     companyLine,
-    engagements,
-    activities,
-    notes
+    timeline
   } = hubspotData;
 
   // Format channel history
@@ -85,9 +83,7 @@ HubSpot Deal Information:
 - Closed: ${closed || "Not observed in HubSpot history"}${cycleDays != null ? ` (${cycleDays} days cycle)` : ""}
 - Contacts: ${contactsLine || "Not observed in HubSpot history"}
 - Companies: ${companyLine || "Not observed in HubSpot history"}
-${engagements ? `\nEngagements:\n${engagements}` : ""}
-${activities ? `\nActivities:\n${activities}` : ""}
-${notes ? `\nNotes:\n${notes}` : ""}
+${timeline ? `\nDeal Activity Timeline (most recent first):\n${timeline}` : ""}
 
 Slack Channel History (recent messages from this channel):
 ${channelHistoryText}
