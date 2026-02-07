@@ -41,7 +41,7 @@ async function postToResponseUrl(responseUrl, text, replaceOriginal = false) {
   }
 }
 
-function buildPromptFromHubSpotData({ dealName, hubspotDealUrl, ownerLine, created, closed, cycleDays, contactsLine, companyLine, amount, dealType, dealStage, pipelineName, description, lineItems, timeline }) {
+function buildPromptFromHubSpotData({ dealName, hubspotDealUrl, ownerLine, csmLine, created, closed, cycleDays, contactsLine, companyLine, amount, dealType, dealStage, pipelineName, description, lineItems, timeline }) {
   const instructions = `
 You are writing a deal handoff document for post-sales teams (Deployments, Customer Success, and Training) who are taking over from Sales. The audience has ZERO prior context on this deal — they need to understand who the customer is, what happened during the sales process, and what to watch out for.
 
@@ -82,6 +82,7 @@ Rules:
 HubSpot Deal Data:
 - Deal: ${dealName}
 - Sales Owner: ${ownerLine}
+- CSM: ${csmLine}
 - Amount: ${amount || "Not found in HubSpot records"}
 - Deal Type: ${dealType || "Not found in HubSpot records"}
 - Deal Stage: ${dealStage || "Not found in HubSpot records"}
@@ -185,8 +186,15 @@ export default async function handler(req, res) {
         const { contactIds, companyIds } = associations;
         const [contacts, companies] = await Promise.all([
           batchRead(hs, "contacts", contactIds, ["firstname", "lastname", "jobtitle", "email"]),
-          batchRead(hs, "companies", companyIds, ["name", "domain"])
+          batchRead(hs, "companies", companyIds, ["name", "domain", "csm"])
         ]);
+
+        // Resolve CSM from company record (owner ID → name)
+        const csmOwnerId = companies.length ? companies[0]?.properties?.csm : null;
+        const csmName = csmOwnerId ? await resolveOwnerName(hs, csmOwnerId) : null;
+        const csmLine = csmName
+          ? `${csmName} (from company record)`
+          : "Not assigned in HubSpot";
 
         const ownerLine = ownerName
           ? `${ownerName} (Sales)`
@@ -231,6 +239,7 @@ export default async function handler(req, res) {
           dealName,
           hubspotDealUrl,
           ownerLine,
+          csmLine,
           created,
           closed,
           cycleDays,

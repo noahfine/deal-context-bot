@@ -94,6 +94,7 @@ export function buildQAPrompt({ question, dealData, threadContext, hubspotData, 
     dealName,
     hubspotDealUrl,
     ownerLine,
+    csmLine,
     created,
     closed,
     cycleDays,
@@ -145,6 +146,7 @@ HubSpot Deal Information:
 - Deal name: ${dealName}
 - Deal link: ${hubspotDealUrl}
 - Sales owner: ${ownerLine}
+- CSM: ${csmLine || "Not found in HubSpot records — check emails/Slack for CSM mentions"}
 - Amount: ${amount || "Not found in HubSpot records"}
 - Deal Type: ${dealType || "Not found in HubSpot records"}
 - Deal Stage: ${dealStage || "Not found in HubSpot records"}

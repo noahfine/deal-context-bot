@@ -43,7 +43,7 @@ async function postToResponseUrl(responseUrl, text, replaceOriginal = false) {
   }
 }
 
-function buildDeploymentPlanPrompt({ dealName, hubspotDealUrl, ownerLine, created, closed, cycleDays, contactsLine, companyLine, amount, dealType, dealStage, pipelineName, description, lineItems, timeline, channelHistoryText }) {
+function buildDeploymentPlanPrompt({ dealName, hubspotDealUrl, ownerLine, csmLine, created, closed, cycleDays, contactsLine, companyLine, amount, dealType, dealStage, pipelineName, description, lineItems, timeline, channelHistoryText }) {
   const instructions = `
 You are generating a deployment plan summary for a post-sales team. Extract specific deployment details from the HubSpot deal data and Slack channel history below. This is for internal teams (Deployments, Customer Success, Training) to understand what needs to happen and when for this deal.
 
@@ -99,6 +99,7 @@ DATA EXTRACTION RULES:
 HubSpot Deal Data:
 - Deal: ${dealName}
 - Sales Owner: ${ownerLine}
+- CSM: ${csmLine}
 - Amount: ${amount || "Not available"}
 - Deal Type: ${dealType || "Not available"}
 - Deal Stage: ${dealStage || "Not available"}
@@ -225,8 +226,15 @@ export default async function handler(req, res) {
         const { contactIds, companyIds } = associations;
         const [contacts, companies] = await Promise.all([
           batchRead(hs, "contacts", contactIds, ["firstname", "lastname", "jobtitle", "email"]),
-          batchRead(hs, "companies", companyIds, ["name", "domain"])
+          batchRead(hs, "companies", companyIds, ["name", "domain", "csm"])
         ]);
+
+        // Resolve CSM from company record (owner ID → name)
+        const csmOwnerId = companies.length ? companies[0]?.properties?.csm : null;
+        const csmName = csmOwnerId ? await resolveOwnerName(hs, csmOwnerId) : null;
+        const csmLine = csmName
+          ? `${csmName} (from company record)`
+          : "Not assigned in HubSpot";
 
         const ownerLine = ownerName
           ? `${ownerName} (Sales)`
@@ -271,6 +279,7 @@ export default async function handler(req, res) {
           dealName,
           hubspotDealUrl,
           ownerLine,
+          csmLine,
           created,
           closed,
           cycleDays,

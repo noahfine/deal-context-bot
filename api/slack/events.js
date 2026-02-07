@@ -212,8 +212,15 @@ async function handleAppMention(event) {
     const { contactIds, companyIds } = r.associations;
     const [contacts, companies] = await Promise.all([
       batchRead(hs, "contacts", contactIds, ["firstname", "lastname", "jobtitle", "email"]),
-      batchRead(hs, "companies", companyIds, ["name", "domain"])
+      batchRead(hs, "companies", companyIds, ["name", "domain", "csm"])
     ]);
+
+    // Resolve CSM from company record (owner ID → name)
+    const csmOwnerId = companies.length ? companies[0]?.properties?.csm : null;
+    const csmName = csmOwnerId ? await resolveOwnerName(hs, csmOwnerId) : null;
+    const csmLine = csmName
+      ? `${csmName} (from company record)`
+      : "Not assigned in HubSpot — check emails/Slack for CSM mentions";
 
     const ownerName = r.owner;
     const ownerLine = ownerName
@@ -264,6 +271,7 @@ async function handleAppMention(event) {
         dealName,
         hubspotDealUrl,
         ownerLine,
+        csmLine,
         created,
         closed,
         cycleDays,
