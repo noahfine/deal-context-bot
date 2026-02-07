@@ -31,7 +31,65 @@ export async function callOpenAIForQA(promptText) {
   return text;
 }
 
-export function buildQAPrompt({ question, dealData, threadContext, hubspotData, channelHistory }) {
+const CLASSIFY_TIMEOUT_MS = 8000;
+
+export async function classifyQuestion(question) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) return { scope: "single", keywords: [] };
+
+  try {
+    const prompt = `You classify questions about deals. Respond with JSON only, no markdown.
+Given this question, determine:
+1. Is this asking about a SINGLE deal (the current channel's deal) or about MULTIPLE deals / historical patterns / cross-deal trends / comparisons with other deployments?
+2. If cross-deal, extract 2-5 search keywords that would help find relevant deals in HubSpot (company names, industries, locations, product types, etc.).
+
+Examples of cross-deal questions:
+- "have we run into any concerns deploying to alcohol companies?" → cross-deal, keywords: ["alcohol"]
+- "any similar deployments in Texas?" → cross-deal, keywords: ["Texas"]
+- "have we sold to hospitals before?" → cross-deal, keywords: ["hospital"]
+- "what other Neptune deals have we done?" → cross-deal, keywords: ["Neptune"]
+
+Examples of single-deal questions:
+- "who is the sales owner?" → single
+- "what was the most recent email?" → single
+- "what product did we sell?" → single
+- "did anyone drop the ball?" → single
+
+Question: "${question}"
+
+Respond: {"scope": "single" or "cross-deal", "keywords": ["keyword1", "keyword2"]}`;
+
+    const resp = await axios.post(
+      "https://api.openai.com/v1/responses",
+      { model: "gpt-4.1-mini", input: prompt },
+      {
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        timeout: CLASSIFY_TIMEOUT_MS
+      }
+    );
+
+    const output = resp.data?.output || [];
+    const text = output
+      .flatMap((o) => o.content || [])
+      .filter((c) => c.type === "output_text")
+      .map((c) => c.text)
+      .join("")
+      .trim();
+
+    // Parse JSON from response (handle potential markdown wrapping)
+    const jsonStr = text.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
+    const parsed = JSON.parse(jsonStr);
+    return {
+      scope: parsed.scope === "cross-deal" ? "cross-deal" : "single",
+      keywords: Array.isArray(parsed.keywords) ? parsed.keywords.slice(0, 5) : []
+    };
+  } catch (err) {
+    console.error("[classifyQuestion] error:", err.message);
+    return { scope: "single", keywords: [] };
+  }
+}
+
+export function buildQAPrompt({ question, dealData, threadContext, hubspotData, channelHistory, crossDealResults }) {
   const {
     dealName,
     hubspotDealUrl,
@@ -102,7 +160,12 @@ ${timeline ? `\nDeal Activity Timeline (most recent first):\n${timeline}` : ""}
 Slack Channel History (recent messages):
 ${channelHistoryText}
 ${threadContextText}
+${crossDealResults ? `
+Cross-Deal Search Results (deal metadata only — full activity histories are not available for these deals):
+${crossDealResults}
 
+NOTE: The above are summaries of other deals in your HubSpot portal that may be relevant to the question. Use them to identify patterns, prior experience, or historical context across deals.
+` : ""}
 Rules:
 - CRITICAL: Use the structured deal data (amount, deal type, products/line items, deal stage) as ground truth. Do NOT infer product names, deal type, financial details, or deal structure from email or meeting content — emails may discuss multiple products or options that were not part of the final deal.
 - Answer directly and concisely. Use 1-3 sentences for simple questions, more for questions requiring detail.

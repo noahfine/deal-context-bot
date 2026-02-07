@@ -1,7 +1,8 @@
-import crypto from "crypto";
 import { waitUntil } from "@vercel/functions";
 import axios from "axios";
 import {
+  verifySlackRequest,
+  readRawBody,
   getSlackChannelName,
   getSlackChannelInfo,
   isPublicChannel,
@@ -31,42 +32,11 @@ import {
   fetchDealNotes,
   fetchDealLineItems,
   formatTimelineForPrompt,
-  formatLineItemsForPrompt
+  formatLineItemsForPrompt,
+  searchDealsAcrossPortal,
+  formatCrossDealResults
 } from "./hubspot-data.js";
-import { buildQAPrompt, callOpenAIForQA } from "./openai-qa.js";
-
-function verifySlackRequest(req, rawBody) {
-  const timestamp = req.headers["x-slack-request-timestamp"];
-  const signature = req.headers["x-slack-signature"];
-  if (!timestamp || !signature) return false;
-
-  const fiveMinutes = 60 * 5;
-  const nowSec = Math.floor(Date.now() / 1000);
-  if (Math.abs(nowSec - Number(timestamp)) > fiveMinutes) return false;
-
-  const sigBase = `v0:${timestamp}:${rawBody}`;
-  const mySig =
-    "v0=" +
-    crypto
-      .createHmac("sha256", process.env.SLACK_SIGNING_SECRET)
-      .update(sigBase, "utf8")
-      .digest("hex");
-
-  try {
-    return crypto.timingSafeEqual(Buffer.from(mySig), Buffer.from(signature));
-  } catch {
-    return false;
-  }
-}
-
-async function readRawBody(req) {
-  return await new Promise((resolve, reject) => {
-    let data = "";
-    req.on("data", (chunk) => (data += chunk));
-    req.on("end", () => resolve(data));
-    req.on("error", reject);
-  });
-}
+import { buildQAPrompt, callOpenAIForQA, classifyQuestion } from "./openai-qa.js";
 
 // Vercel Hobby plan has a 10s function timeout. We post a notification if the
 // handler is still running after this threshold so the user knows it's working.
@@ -156,18 +126,20 @@ async function handleAppMention(event) {
     const dealQuery = channelNameToDealQuery(channelName);
     const hs = hubspotClient(accessToken);
 
-    // ── Phase 2: Find deal + fetch channel history (parallel) ──
-    console.log("[handleAppMention] phase 2: find deal + channel history...");
-    const phase2 = [findBestDeal(hs, dealQuery)];
-    if (isPublic) {
-      phase2.push(
-        getChannelHistory(channel_id, 100).catch((err) => {
-          console.error("Error fetching channel history:", err.message);
-          return null;
-        })
-      );
-    }
-    const [deal, rawChannelHistory] = await Promise.all(phase2);
+    // ── Phase 2: Find deal + fetch channel history + classify question (parallel) ──
+    console.log("[handleAppMention] phase 2: find deal + channel history + classify...");
+    const phase2 = [
+      findBestDeal(hs, dealQuery),
+      isPublic
+        ? getChannelHistory(channel_id, 100).catch((err) => {
+            console.error("Error fetching channel history:", err.message);
+            return null;
+          })
+        : Promise.resolve(null),
+      classifyQuestion(question)
+    ];
+    const [deal, rawChannelHistory, classification] = await Promise.all(phase2);
+    console.log("[handleAppMention] classification:", JSON.stringify(classification));
 
     if (!deal) {
       await slackPost(channel_id, `No HubSpot deal found matching "${dealQuery}".`);
@@ -192,6 +164,15 @@ async function handleAppMention(event) {
     const hubspotDealUrl = portalId
       ? `https://app.hubspot.com/contacts/${portalId}/deal/${dealId}`
       : `https://app.hubspot.com/deals/${dealId}`;
+
+    // Cross-deal search if classifier detected a cross-deal question
+    let crossDealResults = null;
+    if (classification.scope === "cross-deal" && classification.keywords?.length) {
+      console.log("[handleAppMention] cross-deal search with keywords:", classification.keywords);
+      const crossDeals = await searchDealsAcrossPortal(hs, classification.keywords, dealId, 20);
+      crossDealResults = formatCrossDealResults(crossDeals);
+      console.log("[handleAppMention] found %d cross-deal results", crossDeals.length);
+    }
 
     // Determine what HubSpot data to fetch based on question
     const requiredData = determineRequiredData(question, deal);
@@ -296,7 +277,8 @@ async function handleAppMention(event) {
         lineItems,
         timeline
       },
-      channelHistory
+      channelHistory,
+      crossDealResults
     });
 
     console.log("[handleAppMention] phase 4: calling OpenAI...");

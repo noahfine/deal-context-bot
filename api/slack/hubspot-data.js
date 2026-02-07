@@ -163,6 +163,62 @@ export function formatLineItemsForPrompt(lineItems) {
     .join("\n");
 }
 
+// ===== Cross-Deal Search =====
+
+export async function searchDealsAcrossPortal(hs, keywords, excludeDealId, limit = 20) {
+  try {
+    // Build filter groups — HubSpot supports up to 3 filterGroups (OR'd together)
+    // Search dealname and description for each keyword
+    const filterGroups = [];
+    for (const keyword of keywords.slice(0, 3)) {
+      filterGroups.push({
+        filters: [
+          { propertyName: "dealname", operator: "CONTAINS_TOKEN", value: keyword }
+        ]
+      });
+    }
+
+    if (!filterGroups.length) return [];
+
+    const resp = await hs.post("/crm/v3/objects/deals/search", {
+      filterGroups,
+      properties: [
+        "dealname", "dealstage", "pipeline", "amount", "dealtype",
+        "closedate", "createdate", "description", "hubspot_owner_id", "deal_currency_code"
+      ],
+      limit
+    });
+
+    const results = (resp.data?.results || [])
+      .filter((d) => d.id !== excludeDealId);
+
+    return results;
+  } catch (err) {
+    console.error("[searchDealsAcrossPortal] error:", err.message, err.response?.status);
+    return [];
+  }
+}
+
+export function formatCrossDealResults(deals) {
+  if (!deals || !deals.length) return null;
+  return deals
+    .map((d) => {
+      const p = d.properties || {};
+      const name = p.dealname || "Unnamed deal";
+      const stage = p.dealstage || "unknown stage";
+      const amount = p.amount ? `$${Number(p.amount).toLocaleString()}` : "no amount";
+      const type = p.dealtype || "";
+      const closed = p.closedate ? new Date(p.closedate).toISOString().split("T")[0] : "";
+      const desc = p.description ? p.description.substring(0, 150) : "";
+      let line = `- ${name} | ${stage} | ${amount}`;
+      if (type) line += ` | ${type}`;
+      if (closed) line += ` | closed ${closed}`;
+      if (desc) line += `\n  ${desc}`;
+      return line;
+    })
+    .join("\n");
+}
+
 // ===== Keyword-Based Data Requirements =====
 
 export function determineRequiredData(question, dealData) {

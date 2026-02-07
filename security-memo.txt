@@ -1,0 +1,99 @@
+SECURITY MEMO: DeCo (Deal Context Bot) — Architecture & Data Access
+
+To: Security Team
+From: Noah Fine
+Date: February 2026
+Re: Architecture and data access overview for the DeCo Slack bot
+
+
+WHAT IT IS
+
+DeCo is an internal Slack bot that provides post-sales teams with deal context by pulling data from HubSpot and summarizing it using OpenAI. Two interfaces: /summary (structured deal handoff document) and @DeCo [question] (ad-hoc Q&A in Slack channels).
+
+
+ARCHITECTURE
+
+Slack → Vercel (serverless functions) → HubSpot API (read-only)
+                                      → OpenAI API (gpt-4.1-mini)
+                                      → Redis Cloud (token storage)
+
+All communication is over HTTPS. The only persistence layer is Redis, used for OAuth token storage and thread context (24-hour TTL on thread keys).
+
+
+ENVIRONMENT VARIABLES (12)
+
+SLACK_CLIENT_ID, SLACK_CLIENT_SECRET, SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN, HUBSPOT_CLIENT_ID, HUBSPOT_CLIENT_SECRET, HUBSPOT_SCOPES, HUBSPOT_PORTAL_ID, SLACK_REDIRECT_URI, HUBSPOT_REDIRECT_URI, OPENAI_API_KEY, deal_summarizer_bot_REDIS_URL
+
+Stored as Vercel environment variables.
+
+
+AUTHENTICATION BY ENDPOINT
+
+/api/slack/events (POST) — Slack HMAC-SHA256 signature verification (timing-safe comparison, 5-min replay window)
+/api/slack/handoff (POST) — Same Slack HMAC-SHA256 signature verification
+/api/hubspot/oauth/start (GET) — None; redirects to HubSpot OAuth consent screen
+/api/hubspot/oauth/callback (GET) — OAuth code exchange using client credentials from env vars
+/api/slack/oauth/callback (GET) — OAuth code exchange using client credentials from env vars
+
+
+TOKEN MANAGEMENT
+
+- Slack and HubSpot OAuth access/refresh tokens stored in Redis as plaintext strings
+- No TTL set on HubSpot token Redis keys. Thread context keys have 24-hour TTL.
+- Tokens cached in-memory on warm Vercel instances for 5 minutes to reduce Redis round-trips
+- Slack tokens refreshed 1 hour before expiry. HubSpot tokens refreshed 60 seconds before expiry.
+
+
+OAUTH FLOW DETAILS
+
+HubSpot: State parameter is a hardcoded string ("deal-context-bot"), not a per-request random value. Callback does not validate the returned state parameter.
+
+Slack: Callback receives a state parameter but does not validate it.
+
+
+HUBSPOT SCOPES (READ-ONLY)
+
+crm.objects.deals.read, crm.objects.contacts.read, crm.objects.companies.read, crm.objects.owners.read, crm.schemas.contacts.read, crm.schemas.companies.read, sales-email-read
+
+No write scopes are requested.
+
+
+DATA READ FROM HUBSPOT
+
+Deals: name, amount, type, stage, pipeline, description, currency, dates, owner
+Contacts: first name, last name, job title, email address (up to 6 per deal)
+Companies: name, domain (up to 2 per deal)
+Emails: subject, sender, recipients, body text (up to 100 per deal)
+Calls: title, duration, direction, disposition, notes (up to 100 per deal)
+Meetings: title, outcome, notes (up to 100 per deal)
+Notes: body text (up to 100 per deal)
+Line Items: product name, quantity, price, amount, SKU, billing frequency, term
+
+
+DATA READ FROM SLACK
+
+- Channel message history: up to 50 recent messages in public channels the bot is in
+- Thread conversation history when responding in-thread
+- Channel metadata (name, type)
+
+
+DATA SENT TO OPENAI
+
+All HubSpot and Slack data listed above is assembled into a text prompt and sent to the OpenAI Responses API (gpt-4.1-mini) via HTTPS POST. This includes contact names, email addresses, job titles, deal amounts, and the full text of emails, call notes, meeting notes, and Slack messages. The application uses OpenAI's standard API. No enterprise agreement, zero-retention tier, or custom data processing agreement is in place.
+
+
+WHAT THE BOT CANNOT DO
+
+- No HubSpot write access (all scopes are read-only)
+- No Slack message modification (can only post new messages as bot identity)
+- No file or attachment access
+- No user impersonation
+- No outbound network calls beyond HubSpot, OpenAI, Slack, and Redis
+
+
+RATE LIMITING
+
+No application-level rate limiting on any endpoint. Slack endpoints require valid HMAC signatures. OAuth endpoints do not.
+
+
+Happy to walk through the codebase in more detail if helpful.

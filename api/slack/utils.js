@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import axios from "axios";
 import Redis from "ioredis";
 
@@ -162,6 +163,41 @@ export async function getSlackBotToken() {
   }
 }
 
+// ===== Slack Request Verification =====
+
+export function verifySlackRequest(req, rawBody) {
+  const timestamp = req.headers["x-slack-request-timestamp"];
+  const signature = req.headers["x-slack-signature"];
+  if (!timestamp || !signature) return false;
+
+  const fiveMinutes = 60 * 5;
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (Math.abs(nowSec - Number(timestamp)) > fiveMinutes) return false;
+
+  const sigBase = `v0:${timestamp}:${rawBody}`;
+  const mySig =
+    "v0=" +
+    crypto
+      .createHmac("sha256", process.env.SLACK_SIGNING_SECRET)
+      .update(sigBase, "utf8")
+      .digest("hex");
+
+  try {
+    return crypto.timingSafeEqual(Buffer.from(mySig), Buffer.from(signature));
+  } catch {
+    return false;
+  }
+}
+
+export async function readRawBody(req) {
+  return await new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (chunk) => (data += chunk));
+    req.on("end", () => resolve(data));
+    req.on("error", reject);
+  });
+}
+
 // ===== Slack API Helpers =====
 
 export async function getSlackChannelName(channel_id) {
@@ -202,6 +238,31 @@ export async function getChannelHistory(channel_id, limit = 100) {
   });
   if (!resp.data?.ok) throw new Error(`Slack conversations.history error: ${resp.data?.error || "unknown_error"}`);
   return resp.data.messages || [];
+}
+
+export async function getExtendedChannelHistory(channel_id, targetCount = 200) {
+  const token = await getSlackBotToken();
+  if (!token) throw new Error("No Slack bot token (install app or set SLACK_BOT_TOKEN)");
+  let allMessages = [];
+  let cursor = undefined;
+
+  while (allMessages.length < targetCount) {
+    const params = { channel: channel_id, limit: Math.min(100, targetCount - allMessages.length) };
+    if (cursor) params.cursor = cursor;
+
+    const resp = await axios.get("https://slack.com/api/conversations.history", {
+      headers: { Authorization: `Bearer ${token}` },
+      params,
+      timeout: SLACK_TIMEOUT_MS
+    });
+
+    if (!resp.data?.ok) break;
+    allMessages = allMessages.concat(resp.data.messages || []);
+    cursor = resp.data.response_metadata?.next_cursor;
+    if (!cursor) break;
+  }
+
+  return allMessages;
 }
 
 export async function getThreadHistory(channel_id, thread_ts) {

@@ -12,7 +12,9 @@ import {
   getDealAssociations,
   batchRead,
   resolveOwnerName,
-  daysBetweenISO
+  daysBetweenISO,
+  getExtendedChannelHistory,
+  isBotMessage
 } from "./utils.js";
 import {
   fetchDealEmails,
@@ -41,60 +43,78 @@ async function postToResponseUrl(responseUrl, text, replaceOriginal = false) {
   }
 }
 
-function buildPromptFromHubSpotData({ dealName, hubspotDealUrl, ownerLine, created, closed, cycleDays, contactsLine, companyLine, amount, dealType, dealStage, pipelineName, description, lineItems, timeline }) {
+function buildDeploymentPlanPrompt({ dealName, hubspotDealUrl, ownerLine, created, closed, cycleDays, contactsLine, companyLine, amount, dealType, dealStage, pipelineName, description, lineItems, timeline, channelHistoryText }) {
   const instructions = `
-You are writing a deal handoff document for post-sales teams (Deployments, Customer Success, and Training) who are taking over from Sales. The audience has ZERO prior context on this deal — they need to understand who the customer is, what happened during the sales process, and what to watch out for.
+You are generating a deployment plan summary for a post-sales team. Extract specific deployment details from the HubSpot deal data and Slack channel history below. This is for internal teams (Deployments, Customer Success, Training) to understand what needs to happen and when for this deal.
 
-Using the HubSpot data below for deal "${dealName}", produce a structured handoff summary. Use Slack mrkdwn formatting.
+Deal: "${dealName}"
+Deal link: ${hubspotDealUrl}
 
-CRITICAL: Use the structured deal data (amount, deal type, products/line items, deal stage) as ground truth for what was sold, the deal structure, and financials. Do NOT infer these details from email or meeting content — emails may discuss multiple products, pricing options, or deal structures that were NOT part of the final deal.
+OUTPUT FORMAT:
+Use Slack mrkdwn formatting. Only include sections where you found actual data — do NOT output sections with "TBD", "Not found", or "Unknown". Omit the section entirely if the data isn't available.
 
-Output the following sections in this exact order. Use bold section headers (*Header*). If data for a section is not available, write "Not found in HubSpot records" under that header — do NOT skip the section.
+Available sections (include only those with data):
 
-*Deal Overview*
-One concise line with: deal name, company, sales owner, key contacts (name + role), and deal cycle length (${cycleDays != null ? `${cycleDays} days` : "unknown"}). Include the deal link: ${hubspotDealUrl}
+*Deployment Plan: ${dealName}*
+${hubspotDealUrl}
 
 *What Was Sold*
-State the products/line items, deal amount, and deal type. Use the Products/Line Items data below — this is the definitive record of what was sold. If line items are available, list them. Include the deal amount and deal type.
+Products/line items, deal amount, deal type. Use line items as ground truth.
 
-*Sales Process Summary*
-2-4 sentences synthesizing how the deal progressed from first contact to close. What were the key milestones, meetings, or turning points? How did the deal close (e.g., demo-driven, referral, negotiation, quick sign)? Draw from emails, meetings, calls, and notes chronologically.
+*Install Details*
+- Install Date
+- Location (facility name + address)
+- Scanner Type/Model
+- Compute Type (one of: Cloud, GovCloud, On Prem, Air Gapped On Prem)
+- Installer / FSE (Field Service Engineer)
 
-*Customer Temperament*
-1-2 sentences on what the customer is like to work with, inferred from communication patterns. Are they responsive or slow? Detail-oriented or hands-off? Friendly, demanding, or neutral? If unclear from the data, say so rather than guessing.
+*Scoping & Preparation*
+- CS/CSM (Customer Success Manager) Scoping Call status
+- Site Readiness notes (IT requirements, power, networking, access)
+- Rocketlane/Jira/Google Sheets project links mentioned in channel
 
-*Current Status & Most Recent Activity*
-What is the latest activity on this deal? What was the most recent conversation about? 1-3 sentences covering where things stand right now.
+*Training*
+- Training Schedule (dates)
+- Training Conductor (who is leading training)
+- Training Format (on-site / remote)
 
-*Open Items, Holdups & Risks*
-Bullet any unresolved items, blockers, concerns, or risks mentioned anywhere in the activity history. If nothing is flagged, write "None identified in HubSpot records."
+*Key Contacts*
+- Customer contacts (from HubSpot)
+- Internal team (sales owner, CSM, FSE, trainer — from emails)
 
-*Key Technical Details*
-Bullet any technical requirements, product specifics, integration needs, or configuration details mentioned. If none, write "None mentioned in HubSpot records."
+*Notable Context & Risks*
+Any special requirements, concerns, access issues, IT coordination needs, shipping considerations, or other deployment context.
 
-Rules:
-- Be concise but do not omit important details. Aim for completeness over brevity.
-- Every claim must come from the data below. Do not invent or assume facts.
-- Write in plain language as if briefing a colleague verbally.
-- Do not dump raw data or field names. Synthesize and summarize.
-- Do not repeat the same information across sections.
+DATA EXTRACTION RULES:
+- Extract specific dates, names, and details. Do not summarize vaguely.
+- Scanner type should primarily come from line items (ground truth for what was sold).
+- Compute types are one of: Cloud, GovCloud, On Prem, Air Gapped On Prem. Look for these exact terms.
+- Internal employee names and roles are often found in email sender/recipient fields and email signatures. CSMs (Customer Success Managers) and FSEs (Field Service Engineers / the installers) are identified by these titles in emails.
+- Rocketlane form submissions (Billing Info and Facility Info) appear in the Slack channel. For the install/shipping address: use the facility address from the Facility Info form, UNLESS the Billing form's shipping address is outside the US — in that case, the Billing form address takes precedence.
+- Look for Rocketlane, Jira, or Google Sheets links shared in the Slack channel.
+- Use BOTH Slack messages and HubSpot emails as primary sources — deployment logistics appear in both.
+- CRITICAL: Use the structured deal data (amount, deal type, products/line items) as ground truth. Do NOT infer product names or deal type from email content.
+- Do not invent information. Only use data provided below.
 
 HubSpot Deal Data:
 - Deal: ${dealName}
 - Sales Owner: ${ownerLine}
-- Amount: ${amount || "Not found in HubSpot records"}
-- Deal Type: ${dealType || "Not found in HubSpot records"}
-- Deal Stage: ${dealStage || "Not found in HubSpot records"}
-- Pipeline: ${pipelineName || "Not found in HubSpot records"}
-- Created: ${created || "Not found in HubSpot records"}
-- Closed: ${closed || "Not found in HubSpot records"}${cycleDays != null ? ` (${cycleDays}-day cycle)` : ""}
-- Company: ${companyLine || "Not found in HubSpot records"}
+- Amount: ${amount || "Not available"}
+- Deal Type: ${dealType || "Not available"}
+- Deal Stage: ${dealStage || "Not available"}
+- Pipeline: ${pipelineName || "Not available"}
+- Created: ${created || "Not available"}
+- Closed: ${closed || "Not available"}${cycleDays != null ? ` (${cycleDays}-day cycle)` : ""}
+- Company: ${companyLine || "Not available"}
 - Contacts: ${contactsLine}
 ${description ? `- Description: ${description}` : ""}
-${lineItems ? `- Products/Line Items:\n${lineItems}` : "- Products/Line Items: None found in HubSpot records"}
+${lineItems ? `- Products/Line Items:\n${lineItems}` : ""}
 
-Activity Timeline (most recent first):
-${timeline || "No activity found in HubSpot."}
+HubSpot Activity Timeline (most recent first):
+${timeline || "No activity found."}
+
+Slack Channel History (most recent first):
+${channelHistoryText || "No channel history available."}
 `.trim();
 
   return instructions;
@@ -120,20 +140,18 @@ export default async function handler(req, res) {
   // Respond within 3 seconds or Slack shows "operation_timeout"
   res.status(200).json({
     response_type: "ephemeral",
-    text: "Generating deal summary... (this may take a moment)"
+    text: "Generating deployment plan... (this may take a moment)"
   });
 
-  // Keep function alive until work completes (Vercel would otherwise stop after res.json)
-  // Set a timer to warn via response_url if we're approaching the Vercel Hobby timeout
-  let summaryFinished = false;
+  let planFinished = false;
   const timeoutWarning = setTimeout(async () => {
-    if (!summaryFinished && response_url) {
-      console.warn("[/summary] approaching Vercel timeout, posting warning");
+    if (!planFinished && response_url) {
+      console.warn("[/plan] approaching Vercel timeout, posting warning");
       await postToResponseUrl(
         response_url,
-        "Still generating the summary, but it's taking longer than expected. " +
+        "Still generating the deployment plan, but it's taking longer than expected. " +
         "If you don't see a response shortly, the Vercel function may have timed out (10s limit on Hobby plan). " +
-        "Try running /summary again.",
+        "Try running /plan again.",
         false
       );
     }
@@ -142,14 +160,36 @@ export default async function handler(req, res) {
   waitUntil(
     (async () => {
       try {
-        // ── Phase 1: Channel name + HubSpot token (parallel) ──
-        const [channelName, accessToken] = await Promise.all([
+        // ── Phase 1: Channel name + HubSpot token + extended Slack history (parallel) ──
+        const [channelName, accessToken, rawChannelHistory] = await Promise.all([
           getSlackChannelName(channel_id),
-          getHubSpotAccessToken()
+          getHubSpotAccessToken(),
+          getExtendedChannelHistory(channel_id, 200).catch((err) => {
+            console.error("[/plan] error fetching extended channel history:", err.message);
+            return [];
+          })
         ]);
 
         const dealQuery = channelNameToDealQuery(channelName);
         const hs = hubspotClient(accessToken);
+
+        // Filter out bot messages from channel history
+        const channelHistory = rawChannelHistory.filter(
+          (msg) => !isBotMessage(msg) && !msg.subtype && msg.text
+        );
+
+        // Format channel history for prompt
+        let channelHistoryText = "No channel history available.";
+        if (channelHistory.length > 0) {
+          channelHistoryText = channelHistory
+            .map((msg) => {
+              const user = msg.user ? `<@${msg.user}>` : "Unknown";
+              const text = (msg.text || "").substring(0, 500);
+              const ts = msg.ts ? new Date(Number(msg.ts) * 1000).toISOString().split("T")[0] : "";
+              return `[${ts}] ${user}: ${text}`;
+            })
+            .join("\n");
+        }
 
         // ── Phase 2: Find deal ──
         const deal = await findBestDeal(hs, dealQuery);
@@ -170,7 +210,7 @@ export default async function handler(req, res) {
           ? `https://app.hubspot.com/contacts/${portalId}/deal/${dealId}`
           : `https://app.hubspot.com/deals/${dealId}`;
 
-        // ── Phase 3: All data fetches in parallel ──
+        // ── Phase 3: All HubSpot data fetches in parallel ──
         const [ownerName, associations, emails, calls, meetings, notes, lineItemsRaw] = await Promise.all([
           resolveOwnerName(hs, ownerId),
           getDealAssociations(hs, dealId),
@@ -227,7 +267,7 @@ export default async function handler(req, res) {
         const pipelineName = deal.properties?.pipeline || null;
         const description = deal.properties?.description || null;
 
-        const prompt = buildPromptFromHubSpotData({
+        const prompt = buildDeploymentPlanPrompt({
           dealName,
           hubspotDealUrl,
           ownerLine,
@@ -242,27 +282,28 @@ export default async function handler(req, res) {
           pipelineName,
           description,
           lineItems,
-          timeline
+          timeline,
+          channelHistoryText
         });
 
-        const summaryText = await callOpenAIForQA(prompt);
-        await slackPost(channel_id, summaryText);
-        summaryFinished = true;
+        const planText = await callOpenAIForQA(prompt);
+        await slackPost(channel_id, planText);
+        planFinished = true;
         clearTimeout(timeoutWarning);
-        await postToResponseUrl(response_url, `Posted deal summary to #${channelName}.`, true);
+        await postToResponseUrl(response_url, `Posted deployment plan to #${channelName}.`, true);
       } catch (err) {
-        summaryFinished = true;
+        planFinished = true;
         clearTimeout(timeoutWarning);
-        console.error("/summary error:", err?.message || err, err?.code);
+        console.error("/plan error:", err?.message || err, err?.code);
         let msg = err?.response?.data ? JSON.stringify(err.response.data) : (err?.message || "unknown_error");
         if (err?.code === "ETIMEDOUT" || msg.includes("ETIMEDOUT")) {
           msg = "Redis connection timed out. Check Vercel logs and Redis connectivity.";
         }
         if (response_url) {
-          await postToResponseUrl(response_url, `Summary failed: ${msg}`, true);
+          await postToResponseUrl(response_url, `Deployment plan failed: ${msg}`, true);
         } else {
           try {
-            await slackPost(channel_id, `Summary failed: ${msg}`);
+            await slackPost(channel_id, `Deployment plan failed: ${msg}`);
           } catch (e) {
             console.error("slackPost error:", e.message);
           }
