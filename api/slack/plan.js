@@ -208,8 +208,8 @@ export default async function handler(req, res) {
 
         const portalId = process.env.HUBSPOT_PORTAL_ID;
         const hubspotDealUrl = portalId
-          ? `https://app.hubspot.com/contacts/${portalId}/deal/${dealId}`
-          : `https://app.hubspot.com/deals/${dealId}`;
+          ? `https://app.hubspot.com/contacts/${portalId}/record/0-3/${dealId}`
+          : `(HUBSPOT_PORTAL_ID env var not set — cannot generate deal link)`;
 
         // ── Phase 3: All HubSpot data fetches in parallel ──
         const [ownerName, associations, emails, calls, meetings, notes, lineItemsRaw] = await Promise.all([

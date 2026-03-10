@@ -162,8 +162,8 @@ async function handleAppMention(event) {
 
     const portalId = process.env.HUBSPOT_PORTAL_ID;
     const hubspotDealUrl = portalId
-      ? `https://app.hubspot.com/contacts/${portalId}/deal/${dealId}`
-      : `https://app.hubspot.com/deals/${dealId}`;
+      ? `https://app.hubspot.com/contacts/${portalId}/record/0-3/${dealId}`
+      : `(HUBSPOT_PORTAL_ID env var not set — cannot generate deal link)`;
 
     // Cross-deal search if classifier detected a cross-deal question
     let crossDealResults = null;
