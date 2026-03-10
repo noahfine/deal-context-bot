@@ -45,17 +45,26 @@ function buildPromptFromHubSpotData({ dealName, hubspotDealUrl, ownerLine, csmLi
   const instructions = `
 You are writing a deal handoff document for post-sales teams (Deployments, Customer Success, and Training) who are taking over from Sales. The audience has ZERO prior context on this deal — they need to understand who the customer is, what happened during the sales process, and what to watch out for.
 
-Using the HubSpot data below for deal "${dealName}", produce a structured handoff summary. Use Slack mrkdwn formatting.
+Using the HubSpot data below for deal "${dealName}", produce a structured handoff summary.
 
-CRITICAL: Use the structured deal data (amount, deal type, products/line items, deal stage) as ground truth for what was sold, the deal structure, and financials. Do NOT infer these details from email or meeting content — emails may discuss multiple products, pricing options, or deal structures that were NOT part of the final deal.
+FORMATTING (Slack mrkdwn — follow exactly):
+- Bold with single asterisks: *text* (NOT **text**)
+- Bold all names, companies, roles, deal amounts, and product names for readability
+- For links, paste the raw URL on its own line — do NOT use markdown link syntax like [text](url)
+- Use single asterisks for section headers: *Header*
 
-Output the following sections in this exact order. Use bold section headers (*Header*). If data for a section is not available, write "Not found in HubSpot records" under that header — do NOT skip the section.
+CRITICAL: Use the structured deal data (amount, deal type, Product field, deal stage) as ground truth for what was sold, the deal structure, and financials. Do NOT infer these details from email or meeting content — emails may discuss multiple products, pricing options, or deal structures that were NOT part of the final deal.
+${productDescription ? `\nThe Product field value is "${productDescription}" — use this EXACTLY as written when referring to the product. Do not paraphrase, abbreviate, or split it into separate terms.` : ""}
+${isTrial != null ? `This deal ${isTrial === "Yes" ? "IS" : "is NOT"} a trial.` : ""}
+
+Output the following sections in this exact order. Use *Header* for section headers. If data for a section is not available, write "Not found in HubSpot records" under that header — do NOT skip the section.
 
 *Deal Overview*
-One concise line with: deal name, company, sales owner, key contacts (name + role), and deal cycle length (${cycleDays != null ? `${cycleDays} days` : "unknown"}). Include the deal link: ${hubspotDealUrl}
+One concise line with: deal name, company, sales owner, key contacts (name + role), and deal cycle length (${cycleDays != null ? `${cycleDays} days` : "unknown"}). Put the deal link on the next line by itself:
+${hubspotDealUrl}
 
 *What Was Sold*
-State the products/line items, deal amount, and deal type. Use the Products/Line Items data below — this is the definitive record of what was sold. If line items are available, list them. Include the deal amount and deal type.
+State the product (use the Product field exactly as provided), deal amount, deal type, and whether this is a trial. If line items are available, list them. Do NOT call the product a "scanner" or other generic term — use the exact product name from the Product field.
 
 *Sales Process Summary*
 2-4 sentences synthesizing how the deal progressed from first contact to close. What were the key milestones, meetings, or turning points? How did the deal close (e.g., demo-driven, referral, negotiation, quick sign)? Draw from emails, meetings, calls, and notes chronologically.
@@ -70,7 +79,7 @@ What is the latest activity on this deal? What was the most recent conversation 
 Bullet any unresolved items, blockers, concerns, or risks mentioned anywhere in the activity history. If nothing is flagged, write "None identified in HubSpot records."
 
 *Key Technical Details*
-Bullet any technical requirements, product specifics, integration needs, or configuration details mentioned. If none, write "None mentioned in HubSpot records."
+Bullet any technical requirements, integration needs, or configuration details mentioned in emails/meetings/notes. Do NOT repeat the product name or trial status here — those belong in "What Was Sold." If no additional technical details, write "None mentioned in HubSpot records."
 
 Rules:
 - Be concise but do not omit important details. Aim for completeness over brevity.
@@ -78,6 +87,7 @@ Rules:
 - Write in plain language as if briefing a colleague verbally.
 - Do not dump raw data or field names. Synthesize and summarize.
 - Do not repeat the same information across sections.
+- Bold all names, companies, amounts, and product names with *single asterisks*.
 
 HubSpot Deal Data:
 - Deal: ${dealName}
