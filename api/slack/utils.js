@@ -5,13 +5,13 @@ import Redis from "ioredis";
 const SLACK_TIMEOUT_MS = 8000;
 const HUBSPOT_TIMEOUT_MS = 10000;
 
-const redisUrl = process.env.deal_summarizer_bot_REDIS_URL || process.env.REDIS_URL;
+const redisUrl = process.env.REDIS_URL || process.env.deal_summarizer_bot_REDIS_URL;
 
 // Lazy initialization to avoid module load errors at build time
 let redisInstance = null;
 export function getRedis() {
   if (!redisUrl) {
-    throw new Error("Missing deal_summarizer_bot_REDIS_URL environment variable");
+    throw new Error("Missing REDIS_URL environment variable");
   }
   // If the cached instance is dead, discard it so we create a fresh one
   if (redisInstance && redisInstance.status === "end") {
