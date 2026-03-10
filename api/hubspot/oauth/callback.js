@@ -1,19 +1,5 @@
 import axios from "axios";
-import Redis from "ioredis";
-
-/* Uses your existing env var (no value pasted here) */
-const redisUrl = process.env.deal_summarizer_bot_REDIS_URL;
-
-if (!redisUrl) {
-  throw new Error("Missing deal_summarizer_bot_REDIS_URL environment variable");
-}
-
-const redis = new Redis(redisUrl, {
-  // Helps avoid hanging during connection issues
-  connectTimeout: 10000,
-  maxRetriesPerRequest: 2,
-  enableReadyCheck: true
-});
+import { getRedis, withTimeout } from "../../slack/utils.js";
 
 export default async function handler(req, res) {
   try {
@@ -60,9 +46,16 @@ export default async function handler(req, res) {
     const expiresAtMs = Date.now() + Number(expires_in || 0) * 1000;
 
     console.log("Writing tokens to Redis...");
-    await redis.set("hubspot:access_token", access_token);
-    await redis.set("hubspot:refresh_token", refresh_token);
-    await redis.set("hubspot:expires_at_ms", String(expiresAtMs));
+    const redis = getRedis();
+    await withTimeout(
+      Promise.all([
+        redis.set("hubspot:access_token", access_token),
+        redis.set("hubspot:refresh_token", refresh_token),
+        redis.set("hubspot:expires_at_ms", String(expiresAtMs)),
+      ]),
+      5000,
+      "Redis write timeout — could not store HubSpot tokens. Check Redis connectivity."
+    );
     console.log("Redis write success");
 
     return res.status(200).send("✅ HubSpot connected. You can close this tab and run /summary in Slack.");
