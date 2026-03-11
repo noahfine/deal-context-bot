@@ -366,10 +366,24 @@ export function isRegulatoryFormQuestion(question) {
 }
 
 const ROCKETLANE_EHS_PATTERN = /ehs|regulatory.*requirement|regulatory.*acknowledgement/i;
-const ASSET_URL_PATTERN = /https?:\/\/[^\s>|]+\.pdf|https?:\/\/assets\.rocketlane\.com\/[^\s>|]+/i;
+// Priority order: Rocketlane asset URLs, then PDFs, then any URL in the message
+const ROCKETLANE_URL_PATTERN = /https?:\/\/assets\.rocketlane\.com\/[^\s>|]+/i;
+const PDF_URL_PATTERN = /https?:\/\/[^\s>|]+\.pdf/i;
+const ANY_URL_PATTERN = /https?:\/\/[^\s>|]+/i;
+
+function extractUrlFromText(text, patterns) {
+  if (!text) return null;
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match) return match[0].replace(/[>|].*$/, "");
+  }
+  return null;
+}
 
 export function findRocketlaneFormMessage(messages) {
   if (!messages || !messages.length) return null;
+
+  const urlPatterns = [ROCKETLANE_URL_PATTERN, PDF_URL_PATTERN];
 
   for (const msg of messages) {
     if (!isBotMessage(msg)) continue;
@@ -379,36 +393,41 @@ export function findRocketlaneFormMessage(messages) {
     let fileUrl = null;
 
     // Check msg.text for URLs (Slack formats as <url|label> or <url>)
-    const textMatch = (msg.text || "").match(ASSET_URL_PATTERN);
-    if (textMatch) {
-      fileUrl = textMatch[0].replace(/[>|].*$/, "");
-    }
+    fileUrl = extractUrlFromText(msg.text || "", urlPatterns);
 
     // Check attachments
     if (!fileUrl && msg.attachments) {
       for (const att of msg.attachments) {
-        const fields = [att.title_link, att.text, att.fallback, att.from_url, att.original_url]
-          .filter(Boolean)
-          .join(" ");
-        const attMatch = fields.match(ASSET_URL_PATTERN);
-        if (attMatch) {
-          fileUrl = attMatch[0].replace(/[>|].*$/, "");
-          break;
+        // Check direct URL fields first
+        const directUrl = att.title_link || att.from_url || att.original_url || att.app_unfurl_url;
+        if (directUrl) {
+          const match = extractUrlFromText(directUrl, urlPatterns);
+          if (match) { fileUrl = match; break; }
         }
+        // Check text content
+        const attText = [att.text, att.fallback].filter(Boolean).join(" ");
+        const match = extractUrlFromText(attText, urlPatterns);
+        if (match) { fileUrl = match; break; }
       }
     }
 
     // Check files
     if (!fileUrl && msg.files) {
       for (const file of msg.files) {
-        const fields = [file.url_private, file.permalink, file.url_private_download]
-          .filter(Boolean)
-          .join(" ");
-        const fileMatch = fields.match(ASSET_URL_PATTERN);
-        if (fileMatch) {
-          fileUrl = fileMatch[0];
-          break;
+        const fileFields = [file.url_private, file.permalink, file.url_private_download];
+        for (const f of fileFields) {
+          const match = extractUrlFromText(f, urlPatterns);
+          if (match) { fileUrl = match; break; }
         }
+        if (fileUrl) break;
+      }
+    }
+
+    // Fallback: grab any URL from attachments (Rocketlane may use non-standard URL structure)
+    if (!fileUrl && msg.attachments) {
+      for (const att of msg.attachments) {
+        const directUrl = att.title_link || att.from_url || att.original_url || att.app_unfurl_url;
+        if (directUrl) { fileUrl = directUrl; break; }
       }
     }
 

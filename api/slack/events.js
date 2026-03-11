@@ -125,6 +125,19 @@ async function handleAppMention(event) {
       return;
     }
 
+    // Ignore referential mentions (talking ABOUT DeCo, not TO DeCo)
+    const REFERENTIAL_PATTERNS = [
+      /\b(ask|tell|use|try|ping|message)\s+<@/i,
+      /\bcan\s+<@/i,
+      /\b<@[^>]+>\s+(can|will|is|does|should)\b/i,
+      /\byou\s+can\s+(also\s+)?ask\b/i,
+      /\btalk\s+to\s+<@/i,
+    ];
+    if (REFERENTIAL_PATTERNS.some((p) => p.test(text))) {
+      console.log("[handleAppMention] ignoring referential mention: %s", text.slice(0, 80));
+      return;
+    }
+
     const isPublic = isPublicChannel(channelInfo);
     const channelName = channelInfo?.name || await getSlackChannelName(channel_id);
     const dealQuery = channelNameToDealQuery(channelName);
