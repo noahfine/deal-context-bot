@@ -115,9 +115,32 @@ export function buildQAPrompt({ question, dealData, threadContext, hubspotData, 
     channelHistoryText = channelHistory
       .slice(0, 50)
       .map((msg) => {
-        const user = msg.user ? `<@${msg.user}>` : "Unknown";
-        const text = msg.text || "";
+        const user = msg.user ? `<@${msg.user}>` : (msg.username || "Bot");
+        let text = msg.text || "";
         const ts = msg.ts ? new Date(Number(msg.ts) * 1000).toISOString().split("T")[0] : "";
+
+        // Include attachment text (Rocketlane forms, rich messages, etc.)
+        if (msg.attachments && msg.attachments.length > 0) {
+          const attText = msg.attachments
+            .map((att) => att.text || att.fallback || "")
+            .filter(Boolean)
+            .join("\n");
+          if (attText) text += "\n" + attText;
+        }
+
+        // Include block text (some bots use blocks instead of attachments)
+        if (msg.blocks && msg.blocks.length > 0) {
+          const blockText = msg.blocks
+            .map((block) => {
+              if (block.text?.text) return block.text.text;
+              if (block.fields) return block.fields.map((f) => f.text).filter(Boolean).join(" | ");
+              return "";
+            })
+            .filter(Boolean)
+            .join("\n");
+          if (blockText && !text.includes(blockText)) text += "\n" + blockText;
+        }
+
         return `[${ts}] ${user}: ${text}`;
       })
       .join("\n");
