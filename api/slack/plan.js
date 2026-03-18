@@ -104,7 +104,8 @@ DATA EXTRACTION RULES:
 - Calibration type: Cal 3 is for metrology-level applications, GD&T, or high-precision dimensional measurement. Fast Cal/Cal2 is standard. Look for mentions of these terms or application types in emails and notes.
 - The CSM is often introduced in a scheduling email. Note whether their scoping call has been scheduled.
 - Crate storage/return decision (keep onsite, ship back, or warehouse storage) is a common open item — flag it if unresolved.
-- Install address: use the Rocketlane Facility Info form from channel history as the primary source.
+- IT/network configuration: look for emails or notes about firewall rules, network requirements, VPN access, static IP setup, or IT readiness. If the customer has been asked to confirm they can meet these requirements and has not yet replied, flag it as a Pending & Open Item.
+- Install address: use the Rocketlane Facility Info form from channel history as the primary source. If the same form was submitted multiple times (e.g., customer resubmitted the Facility Information form), always use the MOST RECENT submission — channel history is ordered newest-first, so earlier entries in the list are more recent.
 - Look for Rocketlane, Jira, or Google Sheets project links mentioned in the channel.
 - Use BOTH HubSpot emails and Slack channel history as sources.
 - CRITICAL: Use structured deal data (line items, amount, deal type) as ground truth for what was sold. Do NOT infer product names from email content.
