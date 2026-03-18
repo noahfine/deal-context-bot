@@ -14,7 +14,8 @@ import {
   resolveOwnerName,
   daysBetweenISO,
   getExtendedChannelHistory,
-  isBotMessage
+  isBotMessage,
+  isRocketlaneMessage
 } from "./utils.js";
 import {
   fetchDealEmails,
@@ -45,56 +46,68 @@ async function postToResponseUrl(responseUrl, text, replaceOriginal = false) {
 
 function buildDeploymentPlanPrompt({ dealName, hubspotDealUrl, ownerLine, csmLine, created, closed, cycleDays, contactsLine, companyLine, amount, dealType, dealStage, pipelineName, description, lineItems, timeline, channelHistoryText }) {
   const instructions = `
-You are generating a deployment plan summary for a post-sales team. Extract specific deployment details from the HubSpot deal data and Slack channel history below. This is for internal teams (Deployments, Customer Success, Training) to understand what needs to happen and when for this deal.
+You are generating a deployment plan summary for a post-sales team (Deployments, Customer Success, Training). Extract specific deployment details from the HubSpot deal data and Slack channel history below.
 
 Deal: "${dealName}"
 Deal link: ${hubspotDealUrl}
 
 OUTPUT FORMAT:
-Use Slack mrkdwn formatting. Only include sections where you found actual data — do NOT output sections with "TBD", "Not found", or "Unknown". Omit the section entirely if the data isn't available.
-
-Available sections (include only those with data):
+Use Slack mrkdwn formatting (*bold* for section headers and field labels). Only include sections where you found actual data — do NOT output sections with "TBD", "Not found", or "Unknown". Omit the section entirely if the data isn't available.
 
 *Deployment Plan: ${dealName}*
 ${hubspotDealUrl}
 
 *What Was Sold*
-Products/line items, deal amount, deal type. Use line items as ground truth.
+Product(s), deal amount, deal type. Use line items as ground truth for what was sold.
+
+*Rigging & Uncrating*
+- *Date:* [date]
+- *Performed by:* [Lumafield-hired riggers / customer's own team / third-party — only report what the emails say; do not assume]
+- *Notes:* [crate storage/return decision if discussed; any coordination details]
 
 *Install Details*
-- Install Date
-- Location (facility name + address)
-- Scanner Type/Model
-- Compute Type (one of: Cloud, GovCloud, On Prem, Air Gapped On Prem)
-- Installer / FSE (Field Service Engineer)
-
-*Scoping & Preparation*
-- CS/CSM (Customer Success Manager) Scoping Call status
-- Site Readiness notes (IT requirements, power, networking, access)
-- Rocketlane/Jira/Google Sheets project links mentioned in channel
+- *Status:* Confirmed / Proposed (pending customer confirmation)
+- *Install Date:* [date(s)]
+- *Installer / FSE:* [name — Field Service Engineer]
+- *Location:* [facility name + full address — use Rocketlane Facility Info form as primary source]
+- *Scanner Type:* [from line items]
+- *Compute Type:* [Cloud / GovCloud / On Prem / Air Gapped On Prem — look for these exact terms]
 
 *Training*
-- Training Schedule (dates)
-- Training Conductor (who is leading training)
-- Training Format (on-site / remote)
+- *Status:* Confirmed / Proposed (pending customer confirmation)
+- *Training Date:* [date(s)]
+- *Trainer:* [name, role e.g. Enablement Engineer]
+- *Others Attending Onsite:* [any other Lumafield staff mentioned as attending]
+- *Training Format:* Onsite / Remote
+- *Training Scope:* [e.g. "Full: radiation awareness + hardware + software" or "Software only for some attendees" — only if mentioned]
 
-*Key Contacts*
-- Customer contacts (from HubSpot)
-- Internal team (sales owner, CSM, FSE, trainer — from emails)
+*Team*
+- *Sales Owner:* ${ownerLine}
+- *CSM:* [name] — Scoping call: [Scheduled for X / Not yet scheduled]
+- *FSE (Installer):* [name]
+- *Trainer:* [name]
+- *Logistics Coordinator:* [name, if mentioned]
+- *Key Customer Contacts:* ${contactsLine}
 
-*Notable Context & Risks*
-Any special requirements, concerns, access issues, IT coordination needs, shipping considerations, or other deployment context.
+*Pending & Open Items*
+List anything explicitly unconfirmed or awaiting action, such as: customer confirmation of dates, crate storage/return decision, CSM scoping call not yet scheduled, site readiness items, etc.
+
+*Notable Context*
+Any special requirements, IT/power/network coordination needs, access or shipping considerations, or other context the deployment team should know.
 
 DATA EXTRACTION RULES:
-- Extract specific dates, names, and details. Do not summarize vaguely.
-- Scanner type should primarily come from line items (ground truth for what was sold).
-- Compute types are one of: Cloud, GovCloud, On Prem, Air Gapped On Prem. Look for these exact terms.
-- Internal employee names and roles are often found in email sender/recipient fields and email signatures. CSMs (Customer Success Managers) and FSEs (Field Service Engineers / the installers) are identified by these titles in emails.
-- Rocketlane form submissions (Billing Info and Facility Info) appear in the Slack channel. For the install/shipping address: use the facility address from the Facility Info form, UNLESS the Billing form's shipping address is outside the US — in that case, the Billing form address takes precedence.
-- Look for Rocketlane, Jira, or Google Sheets links shared in the Slack channel.
-- Use BOTH Slack messages and HubSpot emails as primary sources — deployment logistics appear in both.
-- CRITICAL: Use the structured deal data (amount, deal type, products/line items) as ground truth. Do NOT infer product names or deal type from email content.
-- Do not invent information. Only use data provided below.
+- Read the FULL email timeline — scheduling details evolve over 20-30+ emails. The most recent confirmed schedule supersedes earlier proposals.
+- Scheduling emails often include a summary bullet list at the end (e.g., "Here is a summary of the proposed schedule") — prioritize these for dates.
+- "Proposed" = Lumafield sent proposed dates, customer has not yet explicitly confirmed. "Confirmed" = customer replied affirmatively, or subsequent emails treat the dates as set.
+- Rigging/uncrating can be done by Lumafield-hired riggers, the customer's own team, or a third party — only report what the emails say.
+- The CSM is often formally introduced in a scheduling email. Note whether their scoping call has been scheduled.
+- Crate storage/return decision (keep onsite, ship back to Lumafield, or warehouse storage) is a common open item — flag it if unresolved.
+- Training scope varies: some attendees need full training (radiation awareness + hardware + software), others only software — note this if mentioned.
+- Install address: use the Rocketlane Facility Info form from the Slack channel as the primary source. The form content appears in Slack channel history as a bot message.
+- Look for Rocketlane, Jira, or Google Sheets project links mentioned in the channel.
+- Use BOTH HubSpot emails and Slack channel history as sources for deployment logistics.
+- CRITICAL: Use structured deal data (line items, amount, deal type) as ground truth for what was sold. Do NOT infer product names from email content.
+- Do not invent information. Only include details found in the data provided below.
 
 HubSpot Deal Data:
 - Deal: ${dealName}
@@ -114,7 +127,7 @@ ${lineItems ? `- Products/Line Items:\n${lineItems}` : ""}
 HubSpot Activity Timeline (most recent first):
 ${timeline || "No activity found."}
 
-Slack Channel History (most recent first):
+Slack Channel History:
 ${channelHistoryText || "No channel history available."}
 `.trim();
 
@@ -174,19 +187,48 @@ export default async function handler(req, res) {
         const dealQuery = channelNameToDealQuery(channelName);
         const hs = hubspotClient(accessToken);
 
-        // Filter out bot messages from channel history
-        const channelHistory = rawChannelHistory.filter(
-          (msg) => !isBotMessage(msg) && !msg.subtype && msg.text
-        );
+        // Filter channel history: keep Rocketlane bot messages, exclude other bots
+        const channelHistory = rawChannelHistory.filter((msg) => {
+          if (isBotMessage(msg) && !isRocketlaneMessage(msg)) return false;
+          if (msg.subtype && !isBotMessage(msg)) return false;
+          return !!msg.text;
+        });
 
-        // Format channel history for prompt
+        // Format channel history for prompt — extract nested attachment blocks (Rocketlane forms)
         let channelHistoryText = "No channel history available.";
         if (channelHistory.length > 0) {
           channelHistoryText = channelHistory
             .map((msg) => {
-              const user = msg.user ? `<@${msg.user}>` : "Unknown";
-              const text = (msg.text || "").substring(0, 500);
+              const user = msg.user ? `<@${msg.user}>` : (msg.username || "Bot");
+              let text = msg.text || "";
               const ts = msg.ts ? new Date(Number(msg.ts) * 1000).toISOString().split("T")[0] : "";
+
+              if (msg.attachments?.length > 0) {
+                const attText = msg.attachments
+                  .map((att) => {
+                    if (att.text) return att.text;
+                    if (att.blocks?.length > 0) {
+                      return att.blocks
+                        .map((block) => {
+                          if (block.elements) {
+                            return block.elements
+                              .filter((el) => el.type === "mrkdwn" || el.type === "plain_text")
+                              .map((el) => el.text)
+                              .filter(Boolean)
+                              .join("\n");
+                          }
+                          return block.text?.text || "";
+                        })
+                        .filter(Boolean)
+                        .join("\n");
+                    }
+                    return att.fallback || "";
+                  })
+                  .filter(Boolean)
+                  .join("\n");
+                if (attText) text += "\n" + attText;
+              }
+
               return `[${ts}] ${user}: ${text}`;
             })
             .join("\n");
@@ -264,7 +306,7 @@ export default async function handler(req, res) {
           : "Not found in HubSpot records";
 
         // ── Phase 4: Build timeline + prompt + OpenAI ──
-        const timeline = formatTimelineForPrompt(emails, calls, meetings, notes);
+        const timeline = formatTimelineForPrompt(emails, calls, meetings, notes, 1500, 60);
         const lineItems = formatLineItemsForPrompt(lineItemsRaw);
 
         const amount = deal.properties?.amount

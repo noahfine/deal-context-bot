@@ -279,7 +279,7 @@ function stripHtml(html) {
   return html.replace(/<[^>]*>/g, "").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
 }
 
-export function formatTimelineForPrompt(emails, calls, meetings, notes) {
+export function formatTimelineForPrompt(emails, calls, meetings, notes, maxEmailLength = 200, maxItems = 40) {
   const items = [];
 
   for (const e of (emails || [])) {
@@ -292,7 +292,7 @@ export function formatTimelineForPrompt(emails, calls, meetings, notes) {
     const from = p.hs_email_sender_email || "";
     const to = p.hs_email_to_email || "";
     const body = (p.hs_email_text || stripHtml(p.hs_email_html) || "").replace(/\s+/g, " ").trim();
-    const snippet = body ? `: ${body.substring(0, 200)}` : "";
+    const snippet = body ? `: ${body.substring(0, maxEmailLength)}` : "";
     items.push({
       timestamp: p.hs_timestamp || "0",
       line: `- EMAIL (${direction}) on ${date} — Subject: "${subject}"${from ? ` from ${from}` : ""}${to ? ` to ${to}` : ""}${snippet}`
@@ -352,5 +352,5 @@ export function formatTimelineForPrompt(emails, calls, meetings, notes) {
     (a, b) => Number(new Date(b.timestamp)) - Number(new Date(a.timestamp))
   );
 
-  return items.slice(0, 40).map((i) => i.line).join("\n");
+  return items.slice(0, maxItems).map((i) => i.line).join("\n");
 }
